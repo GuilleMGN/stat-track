@@ -14,7 +14,7 @@ const getDb = (guildId) => {
   db.run(`CREATE TABLE IF NOT EXISTS settings (key TEXT, value TEXT, guild_id TEXT, PRIMARY KEY (key, guild_id))`);
   db.run(`CREATE TABLE IF NOT EXISTS ranks (role_id TEXT, start_elo INTEGER, win_elo INTEGER, loss_elo INTEGER, mvp_elo INTEGER, guild_id TEXT, PRIMARY KEY (role_id, guild_id))`);
   db.run(`CREATE TABLE IF NOT EXISTS queues (channel_id TEXT PRIMARY KEY, guild_id TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS matches (match_number INTEGER, ct_team TEXT, tr_team TEXT, map TEXT, guild_id TEXT, PRIMARY KEY (match_number, guild_id))`);
+  db.run(`CREATE TABLE IF NOT EXISTS matches (match_number INTEGER, ct_team TEXT, tr_team TEXT, map TEXT, guild_id TEXT, scored INTEGER DEFAULT 0, PRIMARY KEY (match_number, guild_id))`);
   return db;
 };
 
@@ -52,18 +52,57 @@ const getRandomMap = (db, guildId) => new Promise(resolve => {
   });
 });
 
+const updatePlayerEloAndRank = async (db, guild, userId, eloChange, isMvp, bonus, channelId) => {
+  return new Promise((resolve) => {
+    db.get(`SELECT elo, name FROM players WHERE user_id = ? AND guild_id = ?`, [userId, guild.id], async (err, row) => {
+      if (err || !row) return resolve({ oldElo: 0, newElo: 0, name: 'Unknown' });
+      const oldElo = row.elo;
+      let newElo = Math.max(0, oldElo + eloChange); // Prevent negative Elo
+      if (isMvp) {
+        const mvpElo = await new Promise(resolve => {
+          db.get(`SELECT mvp_elo FROM ranks WHERE start_elo <= ? AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [oldElo, guild.id], (err, row) => resolve(row?.mvp_elo || 0));
+        });
+        newElo += mvpElo;
+      }
+      newElo += bonus;
+      db.run(`UPDATE players SET elo = ? WHERE user_id = ? AND guild_id = ?`, [newElo, userId, guild.id]);
+
+      const oldRank = await new Promise(resolve => {
+        db.get(`SELECT role_id FROM ranks WHERE start_elo <= ? AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [oldElo, guild.id], (err, row) => resolve(row?.role_id));
+      });
+      await assignRankedRole(db, guild, userId, newElo);
+      const newRank = await new Promise(resolve => {
+        db.get(`SELECT role_id FROM ranks WHERE start_elo <= ? AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [newElo, guild.id], (err, row) => resolve(row?.role_id));
+      });
+
+      if (oldRank !== newRank && channelId) {
+        const updatesChannel = guild.channels.cache.get(channelId);
+        if (updatesChannel) {
+          const embed = new EmbedBuilder()
+            .setColor(newElo > oldElo ? '#00ff00' : '#ff0000')
+            .setDescription(newElo > oldElo ? `@${row.name} has ranked up to <@&${newRank}>` : `@${row.name} has deranked to <@&${newRank}>`);
+          updatesChannel.send({ embeds: [embed] });
+        }
+      }
+      resolve({ oldElo, newElo, name: row.name });
+    });
+  });
+};
+
 const createMatch = async (db, channel, players, guildId) => {
   const matchNumber = await getNextMatchNumber(db, guildId);
   const [ctTeam, trTeam] = shuffleAndSplit(players);
   const map = await getRandomMap(db, guildId);
   const matchEmbed = new EmbedBuilder()
     .setTitle(`Match #${matchNumber}`)
-    .setDescription(`**CT Team:**\n${ctTeam.join('\n')}\n\n**TR Team:**\n${trTeam.join('\n')}\n\n**Map:** ${map}`)
+    .setDescription(`**CT Team 1:**\n${ctTeam.join('\n')}\n\n**TR Team 2:**\n${trTeam.join('\n')}\n\n**Map:** ${map}`)
     .setColor('#00ff00')
     .setTimestamp();
   const row = new ActionRowBuilder()
     .addComponents(
-      new ButtonBuilder().setCustomId('mod_menu').setLabel('Mod Menu').setStyle(ButtonStyle.Primary)
+      new ButtonBuilder().setCustomId('next_match').setLabel('Next').setStyle(ButtonStyle.Success),
+      new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary),
+      new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary)
     );
   await channel.send({ embeds: [matchEmbed], components: [row] });
 
@@ -114,12 +153,27 @@ const commands = [
     .addUserOption(option => option.setName('user').setDescription('The user to check stats for (defaults to you)').setRequired(false)),
   new SlashCommandBuilder().setName('leaderboard').setDescription('Show top 10 players by elo'),
   new SlashCommandBuilder().setName('add_queue').setDescription('Add a queue channel (Mods only)')
-    .addChannelOption(option => option.setName('channel_id').setDescription('The channel for matchmaking').setRequired(true)),
+    .addChannelOption(option => option.setName('channel_id').setDescription('The channel for matchmaking').setRequired(true))
+    .addStringOption(option => option.setName('title').setDescription('Custom title for the queue embed').setRequired(false))
+    .addIntegerOption(option => option.setName('bonus').setDescription('Bonus Elo for winners in this queue').setRequired(false)),
   new SlashCommandBuilder().setName('remove_queue').setDescription('Remove a queue channel (Mods only)')
     .addChannelOption(option => option.setName('channel_id').setDescription('The channel to remove').setRequired(true)),
   new SlashCommandBuilder().setName('queues').setDescription('List all queue channels'),
   new SlashCommandBuilder().setName('set_results_channel').setDescription('Set the results channel (Mods only)')
     .addChannelOption(option => option.setName('channel_id').setDescription('The channel for match logs').setRequired(true)),
+  new SlashCommandBuilder().setName('score').setDescription('Score a match (Mods only)')
+    .addIntegerOption(option => option.setName('match_id').setDescription('The match number to score').setRequired(true))
+    .addIntegerOption(option => option.setName('winner_team').setDescription('The winning team number (1 or 2)').setRequired(true))
+    .addUserOption(option => option.setName('mvp1').setDescription('First MVP (optional)').setRequired(false))
+    .addUserOption(option => option.setName('mvp2').setDescription('Second MVP (optional)').setRequired(false)),
+  new SlashCommandBuilder().setName('sub').setDescription('Substitute a player in a match (Mods only)')
+    .addIntegerOption(option => option.setName('match_id').setDescription('The match number').setRequired(true))
+    .addUserOption(option => option.setName('old_player').setDescription('The player to replace').setRequired(true))
+    .addUserOption(option => option.setName('new_player').setDescription('The new player').setRequired(true)),
+  new SlashCommandBuilder().setName('undo').setDescription('Undo scoring for a match (Mods only)')
+    .addIntegerOption(option => option.setName('match_id').setDescription('The match number to undo').setRequired(true)),
+  new SlashCommandBuilder().setName('set_updates_channel').setDescription('Set the rank updates channel (Mods only)')
+    .addChannelOption(option => option.setName('channel_id').setDescription('The channel for rank updates').setRequired(true)),
 ].map(command => command.toJSON());
 
 client.once('ready', async () => {
@@ -160,12 +214,15 @@ client.on('interactionCreate', async (interaction) => {
   });
   const modRoleId = await getModRole();
   const isMod = modRoleId && interaction.member.roles.cache.has(modRoleId);
+  const updatesChannelId = await new Promise(resolve => {
+    db.get(`SELECT value FROM settings WHERE key = 'updates_channel' AND guild_id = ?`, [interaction.guildId], (err, row) => resolve(row?.value));
+  });
 
   if (interaction.isCommand()) {
     const { commandName, options } = interaction;
 
     if (commandName === 'force_register') {
-      if (! avançadoisMod) return interaction.reply('Only moderators can use this command!');
+      if (!avançadoisMod) return interaction.reply('Only moderators can use this command!');
       const targetUser = options.getUser('user');
       const playerName = options.getString('player_name');
       const userId = targetUser.id;
@@ -231,7 +288,7 @@ client.on('interactionCreate', async (interaction) => {
           if (err) return interaction.reply('Error unregistering player!');
           const member = interaction.guild.members.cache.get(userId);
           member.setNickname(null).catch(console.error);
-          
+
           // Remove registered role
           const registeredRoleId = await new Promise((resolve) => {
             db.get(`SELECT value FROM settings WHERE key = 'registered_role' AND guild_id = ?`, [interaction.guildId], (err, row) => resolve(row ? row.value : null));
@@ -283,6 +340,135 @@ client.on('interactionCreate', async (interaction) => {
           .setColor('#0099ff')
           .setTimestamp();
         interaction.reply({ embeds: [embed] });
+      });
+    }
+
+    if (commandName === 'score') {
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      const matchId = options.getInteger('match_id');
+      const winnerTeam = options.getInteger('winner_team');
+      const mvp1 = options.getUser('mvp1');
+      const mvp2 = options.getUser('mvp2');
+      if (winnerTeam !== 1 && winnerTeam !== 2) return interaction.reply('Winner team must be 1 or 2!');
+
+      db.get(`SELECT ct_team, tr_team, scored, guild_id FROM matches WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId], async (err, row) => {
+        if (err || !row) return interaction.reply(`Match #${matchId} not found!`);
+        if (row.scored) return interaction.reply(`Match #${matchId} has already been scored!`);
+
+        const ctTeam = row.ct_team.split(',').map(id => id.trim());
+        const trTeam = row.tr_team.split(',').map(id => id.trim());
+        const winningTeam = winnerTeam === 1 ? ctTeam : trTeam;
+        const losingTeam = winnerTeam === 1 ? trTeam : ctTeam;
+
+        const bonus = await new Promise(resolve => {
+          db.get(`SELECT value FROM settings WHERE key = ? AND guild_id = ?`, [`queue_bonus_${interaction.channelId}`, interaction.guildId], (err, row) => resolve(parseInt(row?.value) || 0));
+        });
+
+        const eloChanges = [];
+        for (const userId of winningTeam) {
+          const rank = await new Promise(resolve => {
+            db.get(`SELECT win_elo FROM ranks WHERE start_elo <= (SELECT elo FROM players WHERE user_id = ? AND guild_id = ?) AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [userId, interaction.guildId, interaction.guildId], (err, row) => resolve(row));
+          });
+          const winElo = rank?.win_elo || 0;
+          const isMvp = (userId === mvp1?.id || userId === mvp2?.id);
+          const { oldElo, newElo, name } = await updatePlayerEloAndRank(db, interaction.guild, userId, winElo, isMvp, bonus, updatesChannelId);
+          eloChanges.push(`[${oldElo}] -> [${newElo}] ${name}`);
+        }
+        for (const userId of losingTeam) {
+          const rank = await new Promise(resolve => {
+            db.get(`SELECT loss_elo FROM ranks WHERE start_elo <= (SELECT elo FROM players WHERE user_id = ? AND guild_id = ?) AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [userId, interaction.guildId, interaction.guildId], (err, row) => resolve(row));
+          });
+          const lossElo = -(rank?.loss_elo || 0);
+          const isMvp = (userId === mvp1?.id || userId === mvp2?.id);
+          const { oldElo, newElo, name } = await updatePlayerEloAndRank(db, interaction.guild, userId, lossElo, isMvp, 0, updatesChannelId);
+          eloChanges.push(`[${oldElo}] -> [${newElo}] ${name}`);
+        }
+
+        db.run(`UPDATE matches SET scored = 1 WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId]);
+        const embed = new EmbedBuilder()
+          .setTitle(`Match #${matchId} Results`)
+          .setDescription(eloChanges.join('\n'))
+          .setColor('#00ff00')
+          .setFooter({ text: `Match #${matchId} has been scored` });
+        interaction.reply({ embeds: [embed] });
+      });
+    }
+
+    if (commandName === 'sub') {
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      const matchId = options.getInteger('match_id');
+      const oldPlayer = options.getUser('old_player');
+      const newPlayer = options.getUser('new_player');
+
+      db.get(`SELECT ct_team, tr_team, map, scored FROM matches WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId], async (err, row) => {
+        if (err || !row) return interaction.reply(`Match #${matchId} not found!`);
+        if (row.scored) return interaction.reply(`Match #${matchId} has already been scored and cannot be modified!`);
+
+        let ctTeam = row.ct_team.split(',');
+        let trTeam = row.tr_team.split(',');
+        const allPlayers = [...ctTeam, ...trTeam];
+        if (!allPlayers.includes(oldPlayer.id)) return interaction.reply(`<@${oldPlayer.id}> is not in Match #${matchId}!`);
+        if (allPlayers.includes(newPlayer.id)) return interaction.reply(`<@${newPlayer.id}> is already in Match #${matchId}!`);
+
+        if (ctTeam.includes(oldPlayer.id)) {
+          ctTeam[ctTeam.indexOf(oldPlayer.id)] = newPlayer.id;
+        } else {
+          trTeam[trTeam.indexOf(oldPlayer.id)] = newPlayer.id;
+        }
+
+        db.run(`UPDATE matches SET ct_team = ?, tr_team = ? WHERE match_number = ? AND guild_id = ?`, [ctTeam.join(','), trTeam.join(','), matchId, interaction.guildId]);
+        const embed = new EmbedBuilder()
+          .setTitle(`Match #${matchId}`)
+          .setDescription(`**CT Team 1:**\n${ctTeam.map(id => `<@${id}>`).join('\n')}\n\n**TR Team 2:**\n${trTeam.map(id => `<@${id}>`).join('\n')}\n\n**Map:** ${row.map}`)
+          .setColor('#00ff00')
+          .setTimestamp();
+        interaction.reply({ embeds: [embed] });
+      });
+    }
+
+    if (commandName === 'undo') {
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      const matchId = options.getInteger('match_id');
+
+      db.get(`SELECT ct_team, tr_team, scored FROM matches WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId], async (err, row) => {
+        if (err || !row) return interaction.reply(`Match #${matchId} not found!`);
+        if (!row.scored) return interaction.reply(`Match #${matchId} has not been scored yet!`);
+
+        const ctTeam = row.ct_team.split(',');
+        const trTeam = row.tr_team.split(',');
+        const allPlayers = [...ctTeam, ...trTeam];
+        const eloChanges = [];
+
+        for (const userId of allPlayers) {
+          db.get(`SELECT elo, name FROM players WHERE user_id = ? AND guild_id = ?`, [userId, interaction.guildId], async (err, player) => {
+            if (err || !player) return;
+            const oldElo = player.elo;
+            const originalElo = await new Promise(resolve => {
+              db.get(`SELECT elo FROM players WHERE user_id = ? AND guild_id = ?`, [userId, interaction.guildId], (err, row) => resolve(row?.elo || 0));
+            });
+            db.run(`UPDATE players SET elo = ? WHERE user_id = ? AND guild_id = ?`, [originalElo, userId, interaction.guildId]);
+            await assignRankedRole(db, interaction.guild, userId, originalElo);
+            eloChanges.push(`[${oldElo}] -> [${originalElo}] ${player.name}`);
+          });
+        }
+
+        db.run(`UPDATE matches SET scored = 0 WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId]);
+        const embed = new EmbedBuilder()
+          .setTitle(`Match #${matchId} Undo`)
+          .setDescription(eloChanges.join('\n'))
+          .setColor('#ff0000')
+          .setFooter({ text: `Match #${matchId} scoring has been undone` });
+        interaction.reply({ embeds: [embed] });
+      });
+    }
+
+    if (commandName === 'set_updates_channel') {
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      const channel = options.getChannel('channel_id');
+      if (channel.type !== 0) return interaction.reply('Please select a text channel!');
+      db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES ('updates_channel', ?, ?)`, [channel.id, interaction.guildId], err => {
+        if (err) return interaction.reply('Error setting updates channel!');
+        interaction.reply(`Updates channel set to <#${channel.id}>!`);
       });
     }
 
@@ -367,22 +553,56 @@ client.on('interactionCreate', async (interaction) => {
 
       const playerName = options.getString('player_name');
       const userId = interaction.user.id;
-      db.get(`SELECT name FROM players WHERE user_id = ? AND guild_id = ?`, [userId, interaction.guildId], async (err, dbRow) => {
-        if (err) return interaction.reply('Error checking registration!');
-        if (dbRow) return interaction.reply('You are already registered!');
+      const member = interaction.member;
 
-        const embed = new EmbedBuilder()
-          .setTitle('Registration Request')
-          .setDescription(`<@${userId}> registration awaiting approval...`)
-          .setColor('#ffff00')
-          .setFooter({ text: `Requested Name: ${playerName}` });
-        const row = new ActionRowBuilder()
-          .addComponents(
-            new ButtonBuilder().setCustomId(`approve_${userId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`decline_${userId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId(`help_${userId}`).setLabel('Help').setStyle(ButtonStyle.Secondary)
-          );
-        await interaction.reply({ embeds: [embed], components: [row] });
+      // Fetch the registered role ID
+      const registeredRoleId = await new Promise((resolve) => {
+        db.get(`SELECT value FROM settings WHERE key = 'registered_role' AND guild_id = ?`, [interaction.guildId], (err, row) => resolve(row ? row.value : null));
+      });
+
+      // Check if user has the Registered role
+      const hasRegisteredRole = registeredRoleId && member.roles.cache.has(registeredRoleId);
+
+      db.get(`SELECT name, elo FROM players WHERE user_id = ? AND guild_id = ?`, [userId, interaction.guildId], async (err, dbRow) => {
+        if (err) return interaction.reply('Error checking registration!');
+
+        // If user has the Registered role and is in the database, they’re fully registered
+        if (hasRegisteredRole && dbRow) {
+          return interaction.reply('You are already registered!');
+        }
+
+        // If user is in the database but doesn’t have the Registered role, request re-approval
+        if (dbRow && !hasRegisteredRole) {
+          const embed = new EmbedBuilder()
+            .setTitle('Registration Request')
+            .setDescription(`<@${userId}> registration awaiting approval...`)
+            .setColor('#ffff00')
+            .setFooter({ text: `Requested Name: ${playerName} | Re-registration` });
+          const row = new ActionRowBuilder()
+            .addComponents(
+              new ButtonBuilder().setCustomId(`approve_${userId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
+              new ButtonBuilder().setCustomId(`decline_${userId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
+              new ButtonBuilder().setCustomId(`help_${userId}`).setLabel('Help').setStyle(ButtonStyle.Secondary)
+            );
+          await interaction.reply({ embeds: [embed], components: [row] });
+          return;
+        }
+
+        // If user is not in the database, proceed with new registration
+        if (!dbRow) {
+          const embed = new EmbedBuilder()
+            .setTitle('Registration Request')
+            .setDescription(`<@${userId}> registration awaiting approval...`)
+            .setColor('#ffff00')
+            .setFooter({ text: `Requested Name: ${playerName}` });
+          const row = new ActionRowBuilder()
+            .addComponents(
+              new ButtonBuilder().setCustomId(`approve_${userId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
+              new ButtonBuilder().setCustomId(`decline_${userId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
+              new ButtonBuilder().setCustomId(`help_${userId}`).setLabel('Help').setStyle(ButtonStyle.Secondary)
+            );
+          await interaction.reply({ embeds: [embed], components: [row] });
+        }
       });
     }
 
@@ -467,11 +687,13 @@ client.on('interactionCreate', async (interaction) => {
     if (commandName === 'add_queue') {
       if (!isMod) return interaction.reply('Only moderators can use this command!');
       const channel = options.getChannel('channel_id');
+      const title = options.getString('title') || 'Matchmaking Queue';
+      const bonus = options.getInteger('bonus') || 0; // Default to 0 if not provided
       if (channel.type !== 0) return interaction.reply('Please select a text channel!');
       db.run(`INSERT OR IGNORE INTO queues (channel_id, guild_id) VALUES (?, ?)`, [channel.id, interaction.guildId], async err => {
         if (err) return interaction.reply('Error adding queue channel!');
         const embed = new EmbedBuilder()
-          .setTitle('Matchmaking Queue')
+          .setTitle(title)
           .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
           .setColor('#0099ff')
           .setFooter({ text: 'Queue initialized' })
@@ -484,6 +706,7 @@ client.on('interactionCreate', async (interaction) => {
           );
         const msg = await channel.send({ embeds: [embed], components: [row] });
         db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${channel.id}`, msg.id, interaction.guildId]);
+        db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_bonus_${channel.id}`, bonus, interaction.guildId]);
         interaction.reply(`Queue channel set to <#${channel.id}>!`);
       });
     }
@@ -493,7 +716,7 @@ client.on('interactionCreate', async (interaction) => {
       const channel = options.getChannel('channel_id');
       db.get(`SELECT channel_id FROM queues WHERE channel_id = ? AND guild_id = ?`, [channel.id, interaction.guildId], async (err, row) => {
         if (err || !row) return interaction.reply(`<#${channel.id}> is not a queue channel!`);
-        
+
         // Fetch and delete the queue embed message
         const msgId = await new Promise(resolve => {
           db.get(`SELECT value FROM settings WHERE key = ? AND guild_id = ?`, [`queue_message_${channel.id}`, interaction.guildId], (err, row) => resolve(row?.value));
@@ -551,26 +774,49 @@ client.on('interactionCreate', async (interaction) => {
       }
 
       const embed = interaction.message.embeds[0];
-      const playerName = embed.footer?.text.split(': ')[1];
+      const playerName = embed.footer?.text.split(': ')[1].split(' | ')[0]; // Extract name before any " | Re-registration"
 
       if (action === 'approve') {
         if (!playerName) return interaction.reply('Error: Player name not found in request!');
-        db.run(`INSERT INTO players (user_id, name, elo, wins, losses, mvps, guild_id) VALUES (?, ?, 0, 0, 0, 0, ?)`,
-          [userId, playerName, guildId], async (err) => {
-            if (err) return interaction.reply('Error registering player!');
-            const registeredRoleId = await new Promise((resolve) => {
-              db.get(`SELECT value FROM settings WHERE key = 'registered_role' AND guild_id = ?`, [guildId], (err, row) => resolve(row ? row.value : null));
-            });
-            const member = interaction.guild.members.cache.get(userId);
+        db.get(`SELECT name, elo FROM players WHERE user_id = ? AND guild_id = ?`, [userId, guildId], async (err, dbRow) => {
+          if (err) return interaction.reply('Error checking player!');
+
+          const member = interaction.guild.members.cache.get(userId);
+          const registeredRoleId = await new Promise((resolve) => {
+            db.get(`SELECT value FROM settings WHERE key = 'registered_role' AND guild_id = ?`, [guildId], (err, row) => resolve(row ? row.value : null));
+          });
+
+          if (dbRow) {
+            // Re-registration: Update name if changed and reassign roles
+            if (dbRow.name !== playerName) {
+              db.run(`UPDATE players SET name = ? WHERE user_id = ? AND guild_id = ?`, [playerName, userId, guildId], (err) => {
+                if (err) console.error('Error updating player name:', err);
+              });
+            }
             if (registeredRoleId) member.roles.add(registeredRoleId).catch(console.error);
-            await assignRankedRole(db, interaction.guild, userId, 0);
-            member.setNickname(`0 | ${playerName}`).catch(console.error);
+            await assignRankedRole(db, interaction.guild, userId, dbRow.elo);
+            member.setNickname(`${dbRow.elo} | ${playerName}`).catch(console.error);
             const updatedEmbed = EmbedBuilder.from(embed)
               .setDescription(`<@${userId}> registration approved!`)
               .setColor('#00ff00')
-              .setFooter({ text: `Registered as: ${playerName}` });
+              .setFooter({ text: `Re-registered as: ${playerName}` });
             await interaction.update({ embeds: [updatedEmbed], components: [] });
-          });
+          } else {
+            // New registration
+            db.run(`INSERT INTO players (user_id, name, elo, wins, losses, mvps, guild_id) VALUES (?, ?, 0, 0, 0, 0, ?)`,
+              [userId, playerName, guildId], async (err) => {
+                if (err) return interaction.reply('Error registering player!');
+                if (registeredRoleId) member.roles.add(registeredRoleId).catch(console.error);
+                await assignRankedRole(db, interaction.guild, userId, 0);
+                member.setNickname(`0 | ${playerName}`).catch(console.error);
+                const updatedEmbed = EmbedBuilder.from(embed)
+                  .setDescription(`<@${userId}> registration approved!`)
+                  .setColor('#00ff00')
+                  .setFooter({ text: `Registered as: ${playerName}` });
+                await interaction.update({ embeds: [updatedEmbed], components: [] });
+              });
+          }
+        });
       } else if (action === 'decline') {
         const updatedEmbed = EmbedBuilder.from(embed)
           .setDescription(`<@${userId}> registration declined!`)
@@ -632,67 +878,80 @@ client.on('interactionCreate', async (interaction) => {
       });
     }
 
-    if (customId === 'mod_menu') {
-      if (!isMod) return interaction.reply('Only moderators can access this!');
-      const embed = new EmbedBuilder()
-        .setTitle('Mod Menu')
-        .setDescription('**Confirm:** Finalize the match and log it.\n**Maps:** Reshuffle the map.\n**Teams:** Reshuffle the teams.')
-        .setColor('#ff9900');
-      const row = new ActionRowBuilder()
-        .addComponents(
-          new ButtonBuilder().setCustomId('confirm_match').setLabel('Confirm').setStyle(ButtonStyle.Success),
-          new ButtonBuilder().setCustomId('reshuffle_maps').setLabel('Maps').setStyle(ButtonStyle.Primary),
-          new ButtonBuilder().setCustomId('reshuffle_teams').setLabel('Teams').setStyle(ButtonStyle.Primary)
-        );
-      await interaction.reply({ embeds: [embed], components: [row] });
-    }
+    if (customId === 'next_match' || customId === 'maps' || customId === 'teams') {
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this!', ephemeral: true });
 
-    if (customId === 'confirm_match') {
-      if (!isMod) return interaction.reply('Only moderators can confirm matches!');
       const matchEmbed = interaction.message.embeds[0];
-      const matchNumber = matchEmbed.title.match(/#(\d+)/)[1];
-      const ctTeam = matchEmbed.description.match(/\*\*CT Team:\*\*\n([\s\S]*?)\n\n\*\*TR Team:/)[1].split('\n');
-      const trTeam = matchEmbed.description.match(/\*\*TR Team:\*\*\n([\s\S]*?)\n\n\*\*Map:/)[1].split('\n');
-      const map = matchEmbed.description.match(/\*\*Map:\*\* (.*)/)[1];
+      if (!matchEmbed || !matchEmbed.title.match(/Match #\d+/)) {
+        return interaction.reply({ content: 'Invalid match embed!', ephemeral: true });
+      }
 
-      db.run(`INSERT INTO matches (match_number, ct_team, tr_team, map, guild_id) VALUES (?, ?, ?, ?, ?)`,
-        [matchNumber, ctTeam.join(','), trTeam.join(','), map, guildId], async err => {
-          if (err) return interaction.reply('Error saving match!');
-          const resultsChannelId = await new Promise(resolve => {
-            db.get(`SELECT value FROM settings WHERE key = 'results_channel' AND guild_id = ?`, [guildId], (err, row) => resolve(row?.value));
+      if (customId === 'next_match') {
+        const matchNumber = matchEmbed.title.match(/#(\d+)/)[1];
+        const ctTeam = matchEmbed.description.match(/\*\*CT Team:\*\*\n([\s\S]*?)\n\n\*\*TR Team:/)[1].split('\n');
+        const trTeam = matchEmbed.description.match(/\*\*TR Team:\*\*\n([\s\S]*?)\n\n\*\*Map:/)[1].split('\n');
+        const map = matchEmbed.description.match(/\*\*Map:\*\* (.*)/)[1];
+
+        // Log match to results channel
+        db.run(`INSERT INTO matches (match_number, ct_team, tr_team, map, guild_id) VALUES (?, ?, ?, ?, ?)`,
+          [matchNumber, ctTeam.join(','), trTeam.join(','), map, guildId], async err => {
+            if (err) return interaction.reply('Error saving match!');
+            const resultsChannelId = await new Promise(resolve => {
+              db.get(`SELECT value FROM settings WHERE key = 'results_channel' AND guild_id = ?`, [guildId], (err, row) => resolve(row?.value));
+            });
+            if (resultsChannelId) {
+              const resultsChannel = interaction.guild.channels.cache.get(resultsChannelId);
+              if (resultsChannel) await resultsChannel.send({ embeds: [matchEmbed] }); // No buttons
+            }
+
+            // Disable buttons on original embed
+            const disabledRow = new ActionRowBuilder()
+              .addComponents(
+                new ButtonBuilder().setCustomId('next_match').setLabel('Next').setStyle(ButtonStyle.Success).setDisabled(true),
+                new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary).setDisabled(true),
+                new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary).setDisabled(true)
+              );
+            await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
+
+            // Start new queue
+            const newQueueEmbed = new EmbedBuilder()
+              .setTitle('Matchmaking Queue')
+              .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
+              .setColor('#0099ff')
+              .setFooter({ text: 'New queue started' })
+              .setTimestamp();
+            const queueRow = new ActionRowBuilder()
+              .addComponents(
+                new ButtonBuilder().setCustomId('join_queue').setLabel('Join').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('leave_queue').setLabel('Leave').setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId('clear_queue').setLabel('Clear').setStyle(ButtonStyle.Secondary)
+              );
+            const newQueueMsg = await interaction.channel.send({ embeds: [newQueueEmbed], components: [queueRow] });
+            db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${channelId}`, newQueueMsg.id, guildId]);
+
+            await interaction.deferUpdate(); // Acknowledge without replying
           });
-          if (resultsChannelId) {
-            const resultsChannel = interaction.guild.channels.cache.get(resultsChannelId);
-            if (resultsChannel) await resultsChannel.send({ embeds: [matchEmbed] });
-          }
-          interaction.reply('Match confirmed and logged!');
-        });
-    }
+      }
 
-    if (customId === 'reshuffle_maps') {
-      if (!isMod) return interaction.reply('Only moderators can reshuffle maps!');
-      const matchEmbed = interaction.message.embeds[0];
-      const newMap = await getRandomMap(db, guildId);
-      const updatedEmbed = EmbedBuilder.from(matchEmbed)
-        .setDescription(matchEmbed.description.replace(/\*\*Map:\*\* .*/, `**Map:** ${newMap}`))
-        .setFooter({ text: 'Map reshuffled' });
-      await interaction.message.edit({ embeds: [updatedEmbed] });
-      interaction.reply('Map reshuffled!');
-    }
+      if (customId === 'maps') {
+        const newMap = await getRandomMap(db, guildId);
+        const updatedEmbed = EmbedBuilder.from(matchEmbed)
+          .setDescription(matchEmbed.description.replace(/\*\*Map:\*\* .*/, `**Map:** ${newMap}`));
+        await interaction.message.edit({ embeds: [updatedEmbed] });
+        await interaction.deferUpdate(); // Acknowledge without replying
+      }
 
-    if (customId === 'reshuffle_teams') {
-      if (!isMod) return interaction.reply('Only moderators can reshuffle teams!');
-      const matchEmbed = interaction.message.embeds[0];
-      const players = [
-        ...matchEmbed.description.match(/\*\*CT Team:\*\*\n([\s\S]*?)\n\n\*\*TR Team:/)[1].split('\n'),
-        ...matchEmbed.description.match(/\*\*TR Team:\*\*\n([\s\S]*?)\n\n\*\*Map:/)[1].split('\n')
-      ];
-      const [newCtTeam, newTrTeam] = shuffleAndSplit(players);
-      const updatedEmbed = EmbedBuilder.from(matchEmbed)
-        .setDescription(`**CT Team:**\n${newCtTeam.join('\n')}\n\n**TR Team:**\n${newTrTeam.join('\n')}\n\n${matchEmbed.description.match(/\*\*Map:\*\* .*/)[0]}`)
-        .setFooter({ text: 'Teams reshuffled' });
-      await interaction.message.edit({ embeds: [updatedEmbed] });
-      interaction.reply('Teams reshuffled!');
+      if (customId === 'teams') {
+        const players = [
+          ...matchEmbed.description.match(/\*\*CT Team:\*\*\n([\s\S]*?)\n\n\*\*TR Team:/)[1].split('\n'),
+          ...matchEmbed.description.match(/\*\*TR Team:\*\*\n([\s\S]*?)\n\n\*\*Map:/)[1].split('\n')
+        ];
+        const [newCtTeam, newTrTeam] = shuffleAndSplit(players);
+        const updatedEmbed = EmbedBuilder.from(matchEmbed)
+          .setDescription(`**CT Team:**\n${newCtTeam.join('\n')}\n\n**TR Team:**\n${newTrTeam.join('\n')}\n\n${matchEmbed.description.match(/\*\*Map:\*\* .*/)[0]}`);
+        await interaction.message.edit({ embeds: [updatedEmbed] });
+        await interaction.deferUpdate(); // Acknowledge without replying
+      }
     }
   }
 });
