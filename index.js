@@ -9,12 +9,33 @@ const getDb = (guildId) => {
     if (err) console.error(`Database error for guild ${guildId}:`, err);
     console.log(`Connected to SQLite database for guild ${guildId}.`);
   });
-  db.run(`CREATE TABLE IF NOT EXISTS maps (map_name TEXT UNIQUE, guild_id TEXT, PRIMARY KEY (map_name, guild_id))`);
-  db.run(`CREATE TABLE IF NOT EXISTS players (user_id TEXT, name TEXT UNIQUE, elo INTEGER DEFAULT 0, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, mvps INTEGER DEFAULT 0, guild_id TEXT, PRIMARY KEY (user_id, guild_id))`);
-  db.run(`CREATE TABLE IF NOT EXISTS settings (key TEXT, value TEXT, guild_id TEXT, PRIMARY KEY (key, guild_id))`);
-  db.run(`CREATE TABLE IF NOT EXISTS ranks (role_id TEXT, start_elo INTEGER, win_elo INTEGER, loss_elo INTEGER, mvp_elo INTEGER, guild_id TEXT, PRIMARY KEY (role_id, guild_id))`);
-  db.run(`CREATE TABLE IF NOT EXISTS queues (channel_id TEXT PRIMARY KEY, guild_id TEXT)`);
-  db.run(`CREATE TABLE IF NOT EXISTS matches (match_number INTEGER, ct_team TEXT, tr_team TEXT, map TEXT, guild_id TEXT, scored INTEGER DEFAULT 0, PRIMARY KEY (match_number, guild_id))`);
+
+  db.serialize(() => {
+    // Create all tables
+    db.run(`CREATE TABLE IF NOT EXISTS maps (map_name TEXT UNIQUE, guild_id TEXT, PRIMARY KEY (map_name, guild_id))`);
+    db.run(`CREATE TABLE IF NOT EXISTS players (user_id TEXT, name TEXT UNIQUE, elo INTEGER DEFAULT 0, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, mvps INTEGER DEFAULT 0, guild_id TEXT, PRIMARY KEY (user_id, guild_id))`);
+    db.run(`CREATE TABLE IF NOT EXISTS settings (key TEXT, value TEXT, guild_id TEXT, PRIMARY KEY (key, guild_id))`);
+    db.run(`CREATE TABLE IF NOT EXISTS ranks (role_id TEXT, start_elo INTEGER, win_elo INTEGER, loss_elo INTEGER, mvp_elo INTEGER, guild_id TEXT, PRIMARY KEY (role_id, guild_id))`);
+    db.run(`CREATE TABLE IF NOT EXISTS matches (match_number INTEGER, ct_team TEXT, tr_team TEXT, map TEXT, guild_id TEXT, scored INTEGER DEFAULT 0, PRIMARY KEY (match_number, guild_id))`);
+    db.run(`CREATE TABLE IF NOT EXISTS queues (channel_id TEXT, guild_id TEXT, title TEXT, PRIMARY KEY (channel_id, guild_id))`);
+
+    // Check and update queues table schema
+    db.all(`PRAGMA table_info(queues)`, (err, rows) => {
+      if (err) {
+        console.error('Error checking queues schema:', err);
+        return;
+      }
+      const columns = rows || []; // Default to empty array if undefined
+      const hasTitle = columns.some(row => row.name === 'title');
+      if (!hasTitle) {
+        db.run(`ALTER TABLE queues ADD COLUMN title TEXT`, err => {
+          if (err) console.error('Error adding title column to queues:', err);
+          else console.log('Added title column to queues table');
+        });
+      }
+    });
+  });
+
   return db;
 };
 
@@ -184,25 +205,6 @@ client.once('ready', async () => {
   } catch (error) {
     console.error('Error registering commands:', error);
   }
-});
-
-client.on('messageCreate', async message => {
-  if (message.author.bot) return;
-  const db = getDb(message.guild.id);
-  db.get(`SELECT channel_id FROM queues WHERE channel_id = ? AND guild_id = ?`, [message.channel.id, message.guild.id], async (err, row) => {
-    if (err || !row) return;
-    await message.delete();
-    const msgId = await new Promise(resolve => {
-      db.get(`SELECT value FROM settings WHERE key = ? AND guild_id = ?`, [`queue_message_${message.channel.id}`, message.guild.id], (err, row) => resolve(row?.value));
-    });
-    const queueMsg = await message.channel.messages.fetch(msgId).catch(() => null);
-    if (queueMsg) {
-      const embed = queueMsg.embeds[0];
-      await queueMsg.delete();
-      const newMsg = await message.channel.send({ embeds: [embed], components: queueMsg.components });
-      db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${message.channel.id}`, newMsg.id, message.guild.id]);
-    }
-  });
 });
 
 client.on('interactionCreate', async (interaction) => {
@@ -688,10 +690,21 @@ client.on('interactionCreate', async (interaction) => {
       if (!isMod) return interaction.reply('Only moderators can use this command!');
       const channel = options.getChannel('channel_id');
       const title = options.getString('title') || 'Matchmaking Queue';
-      const bonus = options.getInteger('bonus') || 0; // Default to 0 if not provided
+      const bonus = options.getInteger('bonus') || 0;
       if (channel.type !== 0) return interaction.reply('Please select a text channel!');
-      db.run(`INSERT OR IGNORE INTO queues (channel_id, guild_id) VALUES (?, ?)`, [channel.id, interaction.guildId], async err => {
-        if (err) return interaction.reply('Error adding queue channel!');
+
+      try {
+        await new Promise((resolve, reject) => {
+          db.run(`INSERT OR IGNORE INTO queues (channel_id, guild_id, title) VALUES (?, ?, ?)`, [channel.id, interaction.guildId, title], err => {
+            if (err) {
+              console.error('Error inserting into queues:', err);
+              reject(err);
+            } else {
+              resolve();
+            }
+          });
+        });
+
         const embed = new EmbedBuilder()
           .setTitle(title)
           .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
@@ -705,10 +718,23 @@ client.on('interactionCreate', async (interaction) => {
             new ButtonBuilder().setCustomId('clear_queue').setLabel('Clear').setStyle(ButtonStyle.Secondary)
           );
         const msg = await channel.send({ embeds: [embed], components: [row] });
-        db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${channel.id}`, msg.id, interaction.guildId]);
-        db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_bonus_${channel.id}`, bonus, interaction.guildId]);
+        await new Promise(resolve => {
+          db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${channel.id}`, msg.id, interaction.guildId], err => {
+            if (err) console.error('Error setting queue message ID:', err);
+            resolve();
+          });
+        });
+        await new Promise(resolve => {
+          db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_bonus_${channel.id}`, bonus, interaction.guildId], err => {
+            if (err) console.error('Error setting queue bonus:', err);
+            resolve();
+          });
+        });
         interaction.reply(`Queue channel set to <#${channel.id}>!`);
-      });
+      } catch (error) {
+        interaction.reply('Error adding queue channel!');
+        console.error('Add queue error:', error);
+      }
     }
 
     if (commandName === 'remove_queue') {
@@ -882,75 +908,105 @@ client.on('interactionCreate', async (interaction) => {
       if (!isMod) return interaction.reply({ content: 'Only moderators can use this!', ephemeral: true });
 
       const matchEmbed = interaction.message.embeds[0];
-      if (!matchEmbed || !matchEmbed.title.match(/Match #\d+/)) {
+      if (!matchEmbed || !matchEmbed.title || !matchEmbed.title.match(/Match #\d+/)) {
         return interaction.reply({ content: 'Invalid match embed!', ephemeral: true });
       }
 
-      if (customId === 'next_match') {
-        const matchNumber = matchEmbed.title.match(/#(\d+)/)[1];
-        const ctTeam = matchEmbed.description.match(/\*\*CT Team:\*\*\n([\s\S]*?)\n\n\*\*TR Team:/)[1].split('\n');
-        const trTeam = matchEmbed.description.match(/\*\*TR Team:\*\*\n([\s\S]*?)\n\n\*\*Map:/)[1].split('\n');
-        const map = matchEmbed.description.match(/\*\*Map:\*\* (.*)/)[1];
+      try {
+        if (customId === 'next_match') {
+          const matchNumberMatch = matchEmbed.title.match(/#(\d+)/);
+          if (!matchNumberMatch) throw new Error('Could not extract match number from title');
+          const matchNumber = matchNumberMatch[1];
 
-        // Log match to results channel
-        db.run(`INSERT INTO matches (match_number, ct_team, tr_team, map, guild_id) VALUES (?, ?, ?, ?, ?)`,
-          [matchNumber, ctTeam.join(','), trTeam.join(','), map, guildId], async err => {
-            if (err) return interaction.reply('Error saving match!');
-            const resultsChannelId = await new Promise(resolve => {
-              db.get(`SELECT value FROM settings WHERE key = 'results_channel' AND guild_id = ?`, [guildId], (err, row) => resolve(row?.value));
-            });
-            if (resultsChannelId) {
-              const resultsChannel = interaction.guild.channels.cache.get(resultsChannelId);
-              if (resultsChannel) await resultsChannel.send({ embeds: [matchEmbed] }); // No buttons
-            }
+          const ctMatch = matchEmbed.description.match(/\*\*CT Team 1:\*\*\n([\s\S]*?)\n\n\*\*TR Team 2:/);
+          const trMatch = matchEmbed.description.match(/\*\*TR Team 2:\*\*\n([\s\S]*?)\n\n\*\*Map:/);
+          const mapMatch = matchEmbed.description.match(/\*\*Map:\*\* (.*)/);
+          if (!ctMatch || !trMatch || !mapMatch) throw new Error('Invalid embed description format for teams or map');
 
-            // Disable buttons on original embed
-            const disabledRow = new ActionRowBuilder()
-              .addComponents(
-                new ButtonBuilder().setCustomId('next_match').setLabel('Next').setStyle(ButtonStyle.Success).setDisabled(true),
-                new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary).setDisabled(true),
-                new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary).setDisabled(true)
-              );
-            await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
+          const ctTeam = ctMatch[1].split('\n').filter(line => line.trim());
+          const trTeam = trMatch[1].split('\n').filter(line => line.trim());
+          const map = mapMatch[1];
 
-            // Start new queue
-            const newQueueEmbed = new EmbedBuilder()
-              .setTitle('Matchmaking Queue')
-              .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
-              .setColor('#0099ff')
-              .setFooter({ text: 'New queue started' })
-              .setTimestamp();
-            const queueRow = new ActionRowBuilder()
-              .addComponents(
-                new ButtonBuilder().setCustomId('join_queue').setLabel('Join').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('leave_queue').setLabel('Leave').setStyle(ButtonStyle.Danger),
-                new ButtonBuilder().setCustomId('clear_queue').setLabel('Clear').setStyle(ButtonStyle.Secondary)
-              );
-            const newQueueMsg = await interaction.channel.send({ embeds: [newQueueEmbed], components: [queueRow] });
-            db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${channelId}`, newQueueMsg.id, guildId]);
-
-            await interaction.deferUpdate(); // Acknowledge without replying
+          // Log match to results channel
+          await new Promise((resolve, reject) => {
+            db.run(`INSERT INTO matches (match_number, ct_team, tr_team, map, guild_id) VALUES (?, ?, ?, ?, ?)`,
+              [matchNumber, ctTeam.join(','), trTeam.join(','), map, guildId], err => {
+                if (err) {
+                  console.error(`Error inserting match #${matchNumber}:`, err);
+                  reject(err);
+                } else {
+                  console.log(`Match #${matchNumber} saved to database`);
+                  resolve();
+                }
+              });
           });
-      }
 
-      if (customId === 'maps') {
-        const newMap = await getRandomMap(db, guildId);
-        const updatedEmbed = EmbedBuilder.from(matchEmbed)
-          .setDescription(matchEmbed.description.replace(/\*\*Map:\*\* .*/, `**Map:** ${newMap}`));
-        await interaction.message.edit({ embeds: [updatedEmbed] });
-        await interaction.deferUpdate(); // Acknowledge without replying
-      }
+          const resultsChannelId = await new Promise(resolve => {
+            db.get(`SELECT value FROM settings WHERE key = 'results_channel' AND guild_id = ?`, [guildId], (err, row) => resolve(row?.value));
+          });
+          if (resultsChannelId) {
+            const resultsChannel = interaction.guild.channels.cache.get(resultsChannelId);
+            if (resultsChannel) await resultsChannel.send({ embeds: [matchEmbed] });
+          }
 
-      if (customId === 'teams') {
-        const players = [
-          ...matchEmbed.description.match(/\*\*CT Team:\*\*\n([\s\S]*?)\n\n\*\*TR Team:/)[1].split('\n'),
-          ...matchEmbed.description.match(/\*\*TR Team:\*\*\n([\s\S]*?)\n\n\*\*Map:/)[1].split('\n')
-        ];
-        const [newCtTeam, newTrTeam] = shuffleAndSplit(players);
-        const updatedEmbed = EmbedBuilder.from(matchEmbed)
-          .setDescription(`**CT Team:**\n${newCtTeam.join('\n')}\n\n**TR Team:**\n${newTrTeam.join('\n')}\n\n${matchEmbed.description.match(/\*\*Map:\*\* .*/)[0]}`);
-        await interaction.message.edit({ embeds: [updatedEmbed] });
-        await interaction.deferUpdate(); // Acknowledge without replying
+          const disabledRow = new ActionRowBuilder()
+            .addComponents(
+              new ButtonBuilder().setCustomId('next_match').setLabel('Next').setStyle(ButtonStyle.Success).setDisabled(true),
+              new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary).setDisabled(true),
+              new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary).setDisabled(true)
+            );
+          await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
+
+          const queueTitle = await new Promise(resolve => {
+            db.get(`SELECT title FROM queues WHERE channel_id = ? AND guild_id = ?`, [channelId, guildId], (err, row) => resolve(row?.title || 'Matchmaking Queue'));
+          });
+          const newQueueEmbed = new EmbedBuilder()
+            .setTitle(queueTitle)
+            .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
+            .setColor('#0099ff')
+            .setFooter({ text: 'New queue started' })
+            .setTimestamp();
+          const queueRow = new ActionRowBuilder()
+            .addComponents(
+              new ButtonBuilder().setCustomId('join_queue').setLabel('Join').setStyle(ButtonStyle.Primary),
+              new ButtonBuilder().setCustomId('leave_queue').setLabel('Leave').setStyle(ButtonStyle.Danger),
+              new ButtonBuilder().setCustomId('clear_queue').setLabel('Clear').setStyle(ButtonStyle.Secondary)
+            );
+          const newQueueMsg = await interaction.channel.send({ embeds: [newQueueEmbed], components: [queueRow] });
+          db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${channelId}`, newQueueMsg.id, guildId]);
+
+          await interaction.deferUpdate();
+        }
+
+        if (customId === 'maps') {
+          const newMap = await getRandomMap(db, guildId);
+          const updatedEmbed = EmbedBuilder.from(matchEmbed)
+            .setDescription(matchEmbed.description.replace(/\*\*Map:\*\* .*/, `**Map:** ${newMap}`));
+          await interaction.message.edit({ embeds: [updatedEmbed] });
+          await interaction.deferUpdate();
+        }
+
+        if (customId === 'teams') {
+          const ctMatch = matchEmbed.description.match(/\*\*CT Team 1:\*\*\n([\s\S]*?)\n\n\*\*TR Team 2:/);
+          const trMatch = matchEmbed.description.match(/\*\*TR Team 2:\*\*\n([\s\S]*?)\n\n\*\*Map:/);
+          if (!ctMatch || !trMatch) throw new Error('Invalid team description format');
+
+          const players = [
+            ...ctMatch[1].split('\n').filter(line => line.trim()),
+            ...trMatch[1].split('\n').filter(line => line.trim())
+          ];
+          const [newCtTeam, newTrTeam] = shuffleAndSplit(players);
+          const mapMatch = matchEmbed.description.match(/\*\*Map:\*\* (.*)/);
+          if (!mapMatch) throw new Error('Invalid map format in description');
+          const mapLine = `**Map:** ${mapMatch[1]}`;
+          const updatedEmbed = EmbedBuilder.from(matchEmbed)
+            .setDescription(`**CT Team 1:**\n${newCtTeam.join('\n')}\n\n**TR Team 2:**\n${newTrTeam.join('\n')}\n\n${mapLine}`);
+          await interaction.message.edit({ embeds: [updatedEmbed] });
+          await interaction.deferUpdate();
+        }
+      } catch (error) {
+        console.error(`Button handler error (${customId}):`, error);
+        await interaction.reply({ content: 'An error occurred while processing this action!', ephemeral: true });
       }
     }
   }
