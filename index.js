@@ -9,70 +9,154 @@ const client = new Client({ intents: ['Guilds', 'GuildMessages', 'MessageContent
 const dbCache = new Map();
 
 const getDb = (guildId) => {
-  if (dbCache.has(guildId)) {
-    return dbCache.get(guildId);
-  }
+  return new Promise((resolve, reject) => {
+    if (dbCache.has(guildId)) {
+      resolve(dbCache.get(guildId));
+      return;
+    }
 
-  const db = new sqlite3.Database(`./maps_${guildId}.db`, (err) => {
-    if (err) console.error(`Database error for guild ${guildId}:`, err);
-    console.log(`Connected to SQLite database for guild ${guildId}.`);
-  });
-
-  db.serialize(() => {
-    db.run(`CREATE TABLE IF NOT EXISTS maps (map_name TEXT UNIQUE, guild_id TEXT, PRIMARY KEY (map_name, guild_id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS players (user_id TEXT, name TEXT UNIQUE, elo INTEGER DEFAULT 0, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, mvps INTEGER DEFAULT 0, guild_id TEXT, PRIMARY KEY (user_id, guild_id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS settings (key TEXT, value TEXT, guild_id TEXT, PRIMARY KEY (key, guild_id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS ranks (role_id TEXT, start_elo INTEGER, win_elo INTEGER, loss_elo INTEGER, mvp_elo INTEGER, guild_id TEXT, PRIMARY KEY (role_id, guild_id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS matches (match_number INTEGER, ct_team TEXT, tr_team TEXT, map TEXT, guild_id TEXT, scored INTEGER DEFAULT 0, winner_team INTEGER, mvp1 TEXT, mvp2 TEXT, bonus INTEGER, PRIMARY KEY (match_number, guild_id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS queues (channel_id TEXT, guild_id TEXT, title TEXT, PRIMARY KEY (channel_id, guild_id))`);
-
-    // Check and update queues table schema
-    db.all(`PRAGMA table_info(queues)`, (err, rows) => {
+    const db = new sqlite3.Database(`./maps_${guildId}.db`, (err) => {
       if (err) {
-        console.error('Error checking queues schema:', err);
-        return;
-      }
-      const columns = rows || [];
-      const hasTitle = columns.some(row => row.name === 'title');
-      if (!hasTitle) {
-        db.run(`ALTER TABLE queues ADD COLUMN title TEXT`, err => {
-          if (err) console.error('Error adding title column to queues:', err);
-          else console.log('Added title column to queues table');
-        });
+        console.error(`Database error for guild ${guildId}:`, err);
+        reject(err);
+      } else {
+        console.log(`Connected to SQLite database for guild ${guildId}.`);
       }
     });
 
-    db.all(`PRAGMA table_info(matches)`, (err, rows) => {
-      if (err) {
-        console.error('Error checking matches schema:', err);
-        return;
-      }
-      const columns = rows || [];
-      const hasScored = columns.some(row => row.name === 'scored');
-      const hasWinnerTeam = columns.some(row => row.name === 'winner_team');
-      const hasMvp1 = columns.some(row => row.name === 'mvp1');
-      const hasMvp2 = columns.some(row => row.name === 'mvp2');
-      const hasBonus = columns.some(row => row.name === 'bonus');
-      if (!hasScored) {
-        db.run(`ALTER TABLE matches ADD COLUMN scored INTEGER DEFAULT 0`);
-      }
-      if (!hasWinnerTeam) {
-        db.run(`ALTER TABLE matches ADD COLUMN winner_team INTEGER`);
-      }
-      if (!hasMvp1) {
-        db.run(`ALTER TABLE matches ADD COLUMN mvp1 TEXT`);
-      }
-      if (!hasMvp2) {
-        db.run(`ALTER TABLE matches ADD COLUMN mvp2 TEXT`);
-      }
-      if (!hasBonus) {
-        db.run(`ALTER TABLE matches ADD COLUMN bonus INTEGER`);
-      }
+    db.serialize(() => {
+      // Create tables
+      db.run(`CREATE TABLE IF NOT EXISTS maps (map_name TEXT UNIQUE, guild_id TEXT, PRIMARY KEY (map_name, guild_id))`);
+      db.run(`CREATE TABLE IF NOT EXISTS players (user_id TEXT, name TEXT UNIQUE, elo INTEGER DEFAULT 0, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, mvps INTEGER DEFAULT 0, guild_id TEXT, PRIMARY KEY (user_id, guild_id))`);
+      db.run(`CREATE TABLE IF NOT EXISTS settings (key TEXT, value TEXT, guild_id TEXT, PRIMARY KEY (key, guild_id))`);
+      db.run(`CREATE TABLE IF NOT EXISTS ranks (role_id TEXT, start_elo INTEGER, win_elo INTEGER, loss_elo INTEGER, mvp_elo INTEGER, guild_id TEXT, PRIMARY KEY (role_id, guild_id))`);
+      db.run(`CREATE TABLE IF NOT EXISTS matches (match_number INTEGER, ct_team TEXT, tr_team TEXT, map TEXT, guild_id TEXT, scored INTEGER DEFAULT 0, winner_team INTEGER, mvp1 TEXT, mvp2 TEXT, bonus INTEGER, PRIMARY KEY (match_number, guild_id))`);
+      db.run(`CREATE TABLE IF NOT EXISTS queues (channel_id TEXT, guild_id TEXT, title TEXT, voice_channel_id TEXT, role_id TEXT, PRIMARY KEY (channel_id, guild_id))`);
+
+      // Check and update queues table schema
+      db.all(`PRAGMA table_info(queues)`, (err, rows) => {
+        if (err) {
+          console.error('Error checking queues schema:', err);
+          reject(err);
+          return;
+        }
+        const columns = rows || [];
+        const hasTitle = columns.some(row => row.name === 'title');
+        const hasVoiceChannelId = columns.some(row => row.name === 'voice_channel_id');
+        const hasRoleId = columns.some(row => row.name === 'role_id');
+
+        const migrations = [];
+        if (!hasTitle) {
+          migrations.push(new Promise((res, rej) => {
+            db.run(`ALTER TABLE queues ADD COLUMN title TEXT`, err => {
+              if (err) {
+                console.error('Error adding title column to queues:', err);
+                rej(err);
+              } else {
+                console.log('Added title column to queues table');
+                res();
+              }
+            });
+          }));
+        }
+        if (!hasVoiceChannelId) {
+          migrations.push(new Promise((res, rej) => {
+            db.run(`ALTER TABLE queues ADD COLUMN voice_channel_id TEXT`, err => {
+              if (err) {
+                console.error('Error adding voice_channel_id column to queues:', err);
+                rej(err);
+              } else {
+                console.log('Added voice_channel_id column to queues table');
+                res();
+              }
+            });
+          }));
+        }
+        if (!hasRoleId) {
+          migrations.push(new Promise((res, rej) => {
+            db.run(`ALTER TABLE queues ADD COLUMN role_id TEXT`, err => {
+              if (err) {
+                console.error('Error adding role_id column to queues:', err);
+                rej(err);
+              } else {
+                console.log('Added role_id column to queues table');
+                res();
+              }
+            });
+          }));
+        }
+
+        // Wait for all migrations to complete
+        Promise.all(migrations)
+          .then(() => {
+            // Check and update matches table schema
+            db.all(`PRAGMA table_info(matches)`, (err, rows) => {
+              if (err) {
+                console.error('Error checking matches schema:', err);
+                reject(err);
+                return;
+              }
+              const columns = rows || [];
+              const hasScored = columns.some(row => row.name === 'scored');
+              const hasWinnerTeam = columns.some(row => row.name === 'winner_team');
+              const hasMvp1 = columns.some(row => row.name === 'mvp1');
+              const hasMvp2 = columns.some(row => row.name === 'mvp2');
+              const hasBonus = columns.some(row => row.name === 'bonus');
+
+              const matchMigrations = [];
+              if (!hasScored) {
+                matchMigrations.push(new Promise((res, rej) => {
+                  db.run(`ALTER TABLE matches ADD COLUMN scored INTEGER DEFAULT 0`, err => {
+                    if (err) rej(err);
+                    else res();
+                  });
+                }));
+              }
+              if (!hasWinnerTeam) {
+                matchMigrations.push(new Promise((res, rej) => {
+                  db.run(`ALTER TABLE matches ADD COLUMN winner_team INTEGER`, err => {
+                    if (err) rej(err);
+                    else res();
+                  });
+                }));
+              }
+              if (!hasMvp1) {
+                matchMigrations.push(new Promise((res, rej) => {
+                  db.run(`ALTER TABLE matches ADD COLUMN mvp1 TEXT`, err => {
+                    if (err) rej(err);
+                    else res();
+                  });
+                }));
+              }
+              if (!hasMvp2) {
+                matchMigrations.push(new Promise((res, rej) => {
+                  db.run(`ALTER TABLE matches ADD COLUMN mvp2 TEXT`, err => {
+                    if (err) rej(err);
+                    else res();
+                  });
+                }));
+              }
+              if (!hasBonus) {
+                matchMigrations.push(new Promise((res, rej) => {
+                  db.run(`ALTER TABLE matches ADD COLUMN bonus INTEGER`, err => {
+                    if (err) rej(err);
+                    else res();
+                  });
+                }));
+              }
+
+              Promise.all(matchMigrations)
+                .then(() => {
+                  dbCache.set(guildId, db);
+                  resolve(db);
+                })
+                .catch(reject);
+            });
+          })
+          .catch(reject);
+      });
     });
   });
-
-  dbCache.set(guildId, db);
-  return db;
 };
 
 const assignRankedRole = async (db, guild, userId, elo) => {
@@ -121,12 +205,12 @@ const shuffleAndSplit = (players) => {
   return [shuffled.slice(0, 5), shuffled.slice(5)];
 };
 
-const getRandomMap = (db, guildId) => new Promise(resolve => {
-  db.all(`SELECT map_name FROM maps WHERE guild_id = ?`, [guildId], (err, rows) => {
-    if (err || rows.length === 0) resolve('No maps available');
-    else resolve(rows[Math.floor(Math.random() * rows.length)].map_name);
+const getRandomMap = async (db, guildId) => {
+  const maps = await new Promise(resolve => {
+    db.all(`SELECT map_name FROM maps WHERE guild_id = ?`, [guildId], (err, rows) => resolve(rows?.map(row => row.map_name) || []));
   });
-});
+  return maps.length ? maps[Math.floor(Math.random() * maps.length)] : 'Default Map';
+};
 
 const updatePlayerEloAndRank = async (db, guild, userId, eloChange, isMvp, bonus, channelId) => {
   return new Promise((resolve) => {
@@ -179,41 +263,39 @@ const updatePlayerEloAndRank = async (db, guild, userId, eloChange, isMvp, bonus
 };
 
 const createMatch = async (db, channel, players, guildId) => {
-  const matchNumber = await getNextMatchNumber(db, guildId);
+  const matchNumber = await new Promise(resolve => {
+    db.get(`SELECT MAX(match_number) as max FROM matches WHERE guild_id = ?`, [guildId], (err, row) => {
+      if (err) {
+        console.error('Error getting max match number:', err);
+        resolve(1);
+      } else {
+        resolve((row?.max || 0) + 1);
+      }
+    });
+  });
+
   const [ctTeam, trTeam] = shuffleAndSplit(players);
   const map = await getRandomMap(db, guildId);
-  const matchEmbed = new EmbedBuilder()
+  const bonus = await new Promise(resolve => {
+    db.get(`SELECT value FROM settings WHERE key = ? AND guild_id = ?`, [`queue_bonus_${channel.id}`, guildId], (err, row) => resolve(parseInt(row?.value) || 0));
+  });
+
+  const embed = new EmbedBuilder()
     .setTitle(`Match #${matchNumber}`)
-    .setDescription(`**CT Team 1:**\n${ctTeam.join('\n')}\n\n**TR Team 2:**\n${trTeam.join('\n')}\n\n**Map:** ${map}`)
-    .setColor('#00ff00')
+    .setDescription(
+      `**CT Team 1:**\n${ctTeam.join('\n')}\n\n**TR Team 2:**\n${trTeam.join('\n')}\n\n**Map:** ${map}\n\n**Bonus Elo:** ${bonus}`
+    )
+    .setColor('#ff9900')
     .setTimestamp();
+
   const row = new ActionRowBuilder()
     .addComponents(
       new ButtonBuilder().setCustomId('next_match').setLabel('Next').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary)
     );
-  await channel.send({ embeds: [matchEmbed], components: [row] });
 
-  const queueMsgId = await new Promise(resolve => {
-    db.get(`SELECT value FROM settings WHERE key = ? AND guild_id = ?`, [`queue_message_${channel.id}`, guildId], (err, row) => resolve(row?.value));
-  });
-  const queueMsg = await channel.messages.fetch(queueMsgId);
-  const resetEmbed = EmbedBuilder.from(queueMsg.embeds[0])
-    .setDescription(`**Players:**\nNone\n\n**Count:** 0/10`)
-    .setFooter({ text: 'Match created, queue reset' });
-  await queueMsg.edit({ embeds: [resetEmbed] });
-
-  // Clean player IDs before saving to matches table
-  const cleanCtTeam = ctTeam.map(id => id.replace(/<@|>/g, ''));
-  const cleanTrTeam = trTeam.map(id => id.replace(/<@|>/g, ''));
-  await new Promise((resolve, reject) => {
-    db.run(`INSERT INTO matches (match_number, ct_team, tr_team, map, guild_id) VALUES (?, ?, ?, ?, ?)`,
-      [matchNumber, cleanCtTeam.join(','), cleanTrTeam.join(','), map, guildId], err => {
-        if (err) reject(err);
-        else resolve();
-      });
-  });
+  await channel.send({ embeds: [embed], components: [row] });
 };
 
 const commands = [
@@ -253,7 +335,9 @@ const commands = [
     .addUserOption(option => option.setName('user').setDescription('The user to check stats for (defaults to you)').setRequired(false)),
   new SlashCommandBuilder().setName('leaderboard').setDescription('Show top 10 players by elo'),
   new SlashCommandBuilder().setName('add_queue').setDescription('Add a queue channel (Mods only)')
-    .addChannelOption(option => option.setName('channel_id').setDescription('The channel for matchmaking').setRequired(true))
+    .addChannelOption(option => option.setName('channel_id').setDescription('The text channel for matchmaking').setRequired(true))
+    .addChannelOption(option => option.setName('voice_channel_id').setDescription('The voice channel for role assignment').setRequired(true))
+    .addRoleOption(option => option.setName('role').setDescription('The role assigned to users in the voice channel').setRequired(true))
     .addStringOption(option => option.setName('title').setDescription('Custom title for the queue embed').setRequired(false))
     .addIntegerOption(option => option.setName('bonus').setDescription('Bonus Elo for winners in this queue').setRequired(false)),
   new SlashCommandBuilder().setName('remove_queue').setDescription('Remove a queue channel (Mods only)')
@@ -282,13 +366,79 @@ client.once('ready', async () => {
   try {
     await client.application.commands.set(commands);
     console.log('Slash commands registered!');
+
+    // Process each guild sequentially
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        // Wait for the database to be fully set up
+        const db = await getDb(guild.id);
+
+        // Fetch all queues for this guild
+        const queues = await new Promise(resolve => {
+          db.all(`SELECT channel_id, role_id, title FROM queues WHERE guild_id = ?`, [guild.id], (err, rows) => {
+            if (err) {
+              console.error(`Error fetching queues for guild ${guild.id}:`, err);
+              resolve([]);
+            } else {
+              resolve(rows || []);
+            }
+          });
+        });
+
+        for (const queue of queues) {
+          const { channel_id, role_id, title } = queue;
+          const channel = guild.channels.cache.get(channel_id);
+          if (!channel) continue;
+
+          const msgId = await new Promise(resolve => {
+            db.get(`SELECT value FROM settings WHERE key = ? AND guild_id = ?`, [`queue_message_${channel_id}`, guild.id], (err, row) => resolve(row?.value));
+          });
+          if (!msgId) continue;
+
+          const queueMsg = await channel.messages.fetch(msgId).catch(() => null);
+          if (!queueMsg) continue;
+
+          // Get all members with the role
+          const membersWithRole = guild.members.cache.filter(member => member.roles.cache.has(role_id));
+          const players = [];
+          for (const member of membersWithRole.values()) {
+            const isRegistered = await new Promise(resolve => {
+              db.get(`SELECT 1 FROM players WHERE user_id = ? AND guild_id = ?`, [member.id, guild.id], (err, row) => {
+                if (err) {
+                  console.error(`Error checking player registration for ${member.id}:`, err);
+                  resolve(false);
+                } else {
+                  resolve(!!row);
+                }
+              });
+            });
+
+            if (isRegistered) {
+              players.push(`<@${member.id}>`);
+            }
+          }
+
+          const embed = EmbedBuilder.from(queueMsg.embeds[0])
+            .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${players.length}/10`)
+            .setFooter({ text: 'Queue initialized on bot startup' });
+          await queueMsg.edit({ embeds: [embed] });
+
+          if (players.length === 10) {
+            await createMatch(db, channel, players, guild.id);
+          }
+        }
+      } catch (error) {
+        console.error(`Error initializing queues for guild ${guild.id}:`, error);
+      }
+    }
   } catch (error) {
-    console.error('Error registering commands:', error);
+    console.error('Error registering commands or initializing queues:', error);
   }
 });
 
-client.on('interactionCreate', async (interaction) => {
-  const db = getDb(interaction.guildId);
+client.on('interactionCreate', async interaction => {
+  if (!interaction.guild) return;
+  const db = await getDb(interaction.guildId);
   const getModRole = () => new Promise((resolve) => {
     db.get(`SELECT value FROM settings WHERE key = 'mod_role' AND guild_id = ?`, [interaction.guildId], (err, row) => {
       resolve(row ? row.value : null);
@@ -855,20 +1005,28 @@ client.on('interactionCreate', async (interaction) => {
     if (commandName === 'add_queue') {
       if (!isMod) return interaction.reply('Only moderators can use this command!');
       const channel = options.getChannel('channel_id');
+      const voiceChannel = options.getChannel('voice_channel_id');
+      const role = options.getRole('role');
       const title = options.getString('title') || 'Matchmaking Queue';
       const bonus = options.getInteger('bonus') || 0;
-      if (channel.type !== 0) return interaction.reply('Please select a text channel!');
+
+      if (channel.type !== 0) return interaction.reply('The channel_id must be a text channel!');
+      if (voiceChannel.type !== 2) return interaction.reply('The voice_channel_id must be a voice channel!');
 
       try {
         await new Promise((resolve, reject) => {
-          db.run(`INSERT OR IGNORE INTO queues (channel_id, guild_id, title) VALUES (?, ?, ?)`, [channel.id, interaction.guildId, title], err => {
-            if (err) {
-              console.error('Error inserting into queues:', err);
-              reject(err);
-            } else {
-              resolve();
+          db.run(
+            `INSERT OR IGNORE INTO queues (channel_id, guild_id, title, voice_channel_id, role_id) VALUES (?, ?, ?, ?, ?)`,
+            [channel.id, interaction.guildId, title, voiceChannel.id, role.id],
+            err => {
+              if (err) {
+                console.error('Error inserting into queues:', err);
+                reject(err);
+              } else {
+                resolve();
+              }
             }
-          });
+          );
         });
 
         const embed = new EmbedBuilder()
@@ -877,26 +1035,29 @@ client.on('interactionCreate', async (interaction) => {
           .setColor('#0099ff')
           .setFooter({ text: 'Queue initialized' })
           .setTimestamp();
-        const row = new ActionRowBuilder()
-          .addComponents(
-            new ButtonBuilder().setCustomId('join_queue').setLabel('Join').setStyle(ButtonStyle.Primary),
-            new ButtonBuilder().setCustomId('leave_queue').setLabel('Leave').setStyle(ButtonStyle.Danger),
-            new ButtonBuilder().setCustomId('clear_queue').setLabel('Clear').setStyle(ButtonStyle.Secondary)
+
+        const msg = await channel.send({ embeds: [embed] });
+        await new Promise(resolve => {
+          db.run(
+            `INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`,
+            [`queue_message_${channel.id}`, msg.id, interaction.guildId],
+            err => {
+              if (err) console.error('Error setting queue message ID:', err);
+              resolve();
+            }
           );
-        const msg = await channel.send({ embeds: [embed], components: [row] });
-        await new Promise(resolve => {
-          db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${channel.id}`, msg.id, interaction.guildId], err => {
-            if (err) console.error('Error setting queue message ID:', err);
-            resolve();
-          });
         });
         await new Promise(resolve => {
-          db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_bonus_${channel.id}`, bonus, interaction.guildId], err => {
-            if (err) console.error('Error setting queue bonus:', err);
-            resolve();
-          });
+          db.run(
+            `INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`,
+            [`queue_bonus_${channel.id}`, bonus, interaction.guildId],
+            err => {
+              if (err) console.error('Error setting queue bonus:', err);
+              resolve();
+            }
+          );
         });
-        interaction.reply(`Queue channel set to <#${channel.id}>!`);
+        interaction.reply(`Queue channel set to <#${channel.id}> with voice channel <#${voiceChannel.id}> and role <@&${role.id}>!`);
       } catch (error) {
         interaction.reply('Error adding queue channel!');
         console.error('Add queue error:', error);
@@ -930,12 +1091,26 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (commandName === 'queues') {
-      db.all(`SELECT channel_id FROM queues WHERE guild_id = ?`, [interaction.guildId], (err, rows) => {
+      db.all(`SELECT channel_id, voice_channel_id, role_id, title FROM queues WHERE guild_id = ?`, [interaction.guildId], async (err, rows) => {
         if (err) return interaction.reply('Error fetching queues!');
-        const queueList = rows.map(row => `<#${row.channel_id}>`).join('\n') || 'No queue channels set.';
+
+        const queueList = [];
+        for (const row of rows) {
+          const bonus = await new Promise(resolve => {
+            db.get(`SELECT value FROM settings WHERE key = ? AND guild_id = ?`, [`queue_bonus_${row.channel_id}`, interaction.guildId], (err, row) => resolve(parseInt(row?.value) || 0));
+          });
+          queueList.push(
+            `**Text Channel:** <#${row.channel_id}>\n` +
+            `**Voice Channel:** <#${row.voice_channel_id}>\n` +
+            `**Role:** <@&${row.role_id}>\n` +
+            `**Title:** ${row.title}\n` +
+            `**Bonus Elo:** ${bonus}`
+          );
+        }
+
         const embed = new EmbedBuilder()
           .setTitle('Queue Channels')
-          .setDescription(queueList)
+          .setDescription(queueList.length ? queueList.join('\n\n') : 'No queue channels set.')
           .setColor('#0099ff')
           .setTimestamp();
         interaction.reply({ embeds: [embed] });
@@ -973,6 +1148,7 @@ client.on('interactionCreate', async (interaction) => {
 
   if (interaction.isButton()) {
     const { customId, user, guildId, channelId } = interaction;
+    const db = await getDb(guildId);
 
     if (customId.startsWith('approve_') || customId.startsWith('decline_') || customId.startsWith('help_')) {
       const [action, userId] = customId.split('_');
@@ -1038,73 +1214,6 @@ client.on('interactionCreate', async (interaction) => {
       }
     }
 
-    if (['join_queue', 'leave_queue', 'clear_queue'].includes(customId)) {
-      await interaction.deferUpdate(); // Acknowledge the interaction immediately
-      db.get(`SELECT channel_id FROM queues WHERE channel_id = ? AND guild_id = ?`, [channelId, guildId], async (err, row) => {
-        if (err || !row) return interaction.editReply('This is not a queue channel!');
-
-        const msgId = await new Promise(resolve => {
-          db.get(`SELECT value FROM settings WHERE key = ? AND guild_id = ?`, [`queue_message_${channelId}`, guildId], (err, row) => resolve(row?.value));
-        });
-        const channel = interaction.guild.channels.cache.get(channelId);
-        const queueMsg = await channel.messages.fetch(msgId).catch(() => null);
-        if (!queueMsg) return interaction.editReply('Queue message not found!');
-
-        let embed = queueMsg.embeds[0];
-        let players = embed.description.match(/\*\*Players:\*\*\n([\s\S]*?)\n\n\*\*Count:/)[1].split('\n').filter(p => p && p !== 'None');
-        let count = players.length;
-        const playerDisplayName = interaction.member.nickname || interaction.user.username;
-
-        if (customId === 'join_queue') {
-          const userId = user.id;
-          const isRegistered = await new Promise(resolve => {
-            db.get(`SELECT 1 FROM players WHERE user_id = ? AND guild_id = ?`, [userId, guildId], (err, row) => {
-              if (err) {
-                console.error('Error checking player registration:', err);
-                resolve(false);
-              } else {
-                resolve(!!row);
-              }
-            });
-          });
-
-          if (!isRegistered) {
-            await interaction.followUp({ content: 'You must register using /register before joining the queue!', flags: [4096] });
-            return;
-          }
-
-          if (players.includes(`<@${user.id}>`)) return; // Silently exit
-          if (count >= 10) return interaction.editReply('Queue is full!');
-          players.push(`<@${user.id}>`);
-          count++;
-          embed = EmbedBuilder.from(embed)
-            .setDescription(`**Players:**\n${players.join('\n')}\n\n**Count:** ${count}/10`)
-            .setFooter({ text: `@${playerDisplayName} joined the queue` });
-          await queueMsg.edit({ embeds: [embed] });
-          if (count === 10) await createMatch(db, channel, players, guildId);
-        }
-
-        if (customId === 'leave_queue') {
-          const index = players.indexOf(`<@${user.id}>`);
-          if (index === -1) return; // Silently exit
-          players.splice(index, 1);
-          count--;
-          embed = EmbedBuilder.from(embed)
-            .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${count}/10`)
-            .setFooter({ text: `@${playerDisplayName} left the queue` });
-          await queueMsg.edit({ embeds: [embed] });
-        }
-
-        if (customId === 'clear_queue') {
-          if (!isMod) return interaction.editReply('Only moderators can clear the queue!');
-          embed = EmbedBuilder.from(embed)
-            .setDescription(`**Players:**\nNone\n\n**Count:** 0/10`)
-            .setFooter({ text: `@${playerDisplayName} cleared the queue` });
-          await queueMsg.edit({ embeds: [embed] });
-        }
-      });
-    }
-
     if (customId === 'next_match' || customId === 'maps' || customId === 'teams') {
       if (!isMod) return interaction.reply({ content: 'Only moderators can use this!', flags: [4096] });
 
@@ -1131,8 +1240,10 @@ client.on('interactionCreate', async (interaction) => {
 
             // Log match to results channel
             await new Promise((resolve, reject) => {
-              db.run(`INSERT INTO matches (match_number, ct_team, tr_team, map, guild_id) VALUES (?, ?, ?, ?, ?)`,
-                [matchNumber, ctTeam.join(','), trTeam.join(','), map, guildId], err => {
+              db.run(
+                `INSERT INTO matches (match_number, ct_team, tr_team, map, guild_id) VALUES (?, ?, ?, ?, ?)`,
+                [matchNumber, ctTeam.join(','), trTeam.join(','), map, guildId],
+                err => {
                   if (err) {
                     console.error(`Error inserting match #${matchNumber}:`, err);
                     reject(err);
@@ -1140,7 +1251,8 @@ client.on('interactionCreate', async (interaction) => {
                     console.log(`Match #${matchNumber} saved to database`);
                     resolve();
                   }
-                });
+                }
+              );
             });
 
             const resultsChannelId = await new Promise(resolve => {
@@ -1159,6 +1271,34 @@ client.on('interactionCreate', async (interaction) => {
               );
             await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
 
+            // Fetch the voice channel ID for this queue
+            const voiceChannelId = await new Promise(resolve => {
+              db.get(`SELECT voice_channel_id FROM queues WHERE channel_id = ? AND guild_id = ?`, [channelId, guildId], (err, row) => {
+                if (err) {
+                  console.error(`Error fetching voice_channel_id for channel ${channelId}:`, err);
+                  resolve(null);
+                } else {
+                  resolve(row?.voice_channel_id);
+                }
+              });
+            });
+
+            if (voiceChannelId) {
+              const voiceChannel = interaction.guild.channels.cache.get(voiceChannelId);
+              if (voiceChannel && voiceChannel.type === 2) {
+                const members = voiceChannel.members;
+                for (const member of members.values()) {
+                  try {
+                    await member.voice.disconnect();
+                    console.log(`Kicked ${member.user.tag} from voice channel ${voiceChannelId}`);
+                  } catch (error) {
+                    console.error(`Failed to kick ${member.user.tag} from voice channel ${voiceChannelId}:`, error);
+                  }
+                }
+              }
+            }
+
+            // Create a new queue embed
             const queueTitle = await new Promise(resolve => {
               db.get(`SELECT title FROM queues WHERE channel_id = ? AND guild_id = ?`, [channelId, guildId], (err, row) => resolve(row?.title || 'Matchmaking Queue'));
             });
@@ -1168,13 +1308,7 @@ client.on('interactionCreate', async (interaction) => {
               .setColor('#0099ff')
               .setFooter({ text: 'New queue started' })
               .setTimestamp();
-            const queueRow = new ActionRowBuilder()
-              .addComponents(
-                new ButtonBuilder().setCustomId('join_queue').setLabel('Join').setStyle(ButtonStyle.Primary),
-                new ButtonBuilder().setCustomId('leave_queue').setLabel('Leave').setStyle(ButtonStyle.Danger),
-                new ButtonBuilder().setCustomId('clear_queue').setLabel('Clear').setStyle(ButtonStyle.Secondary)
-              );
-            const newQueueMsg = await interaction.channel.send({ embeds: [newQueueEmbed], components: [queueRow] });
+            const newQueueMsg = await interaction.channel.send({ embeds: [newQueueEmbed] });
             db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${channelId}`, newQueueMsg.id, guildId]);
 
             await interaction.deferUpdate();
@@ -1343,6 +1477,86 @@ client.on('interactionCreate', async (interaction) => {
 
         await interaction.editReply({ embeds: [updatedEmbed], components: [disabledRow] });
       }
+    }
+  }
+});
+
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+  const guildId = newMember.guild.id;
+  const db = await getDb(guildId);
+
+  // Fetch all queues for this guild
+  const queues = await new Promise(resolve => {
+    db.all(`SELECT channel_id, role_id, title FROM queues WHERE guild_id = ?`, [guildId], (err, rows) => {
+      if (err) {
+        console.error(`Error fetching queues for guild ${guildId}:`, err);
+        resolve([]);
+      } else {
+        resolve(rows || []);
+      }
+    });
+  });
+
+  for (const queue of queues) {
+    const { channel_id, role_id, title } = queue;
+    const channel = newMember.guild.channels.cache.get(channel_id);
+    if (!channel) continue;
+
+    const msgId = await new Promise(resolve => {
+      db.get(`SELECT value FROM settings WHERE key = ? AND guild_id = ?`, [`queue_message_${channel_id}`, guildId], (err, row) => resolve(row?.value));
+    });
+    if (!msgId) continue;
+
+    const queueMsg = await channel.messages.fetch(msgId).catch(() => null);
+    if (!queueMsg) continue;
+
+    let embed = queueMsg.embeds[0];
+    let players = embed.description.match(/\*\*Players:\*\*\n([\s\S]*?)\n\n\*\*Count:/)[1].split('\n').filter(p => p && p !== 'None');
+    let count = players.length;
+
+    const hadRole = oldMember.roles.cache.has(role_id);
+    const hasRole = newMember.roles.cache.has(role_id);
+
+    if (!hadRole && hasRole) {
+      // Member gained the role
+      if (players.includes(`<@${newMember.id}>`)) continue; // Already in queue
+      if (count >= 10) continue; // Queue is full
+
+      // Check if the member is registered
+      const isRegistered = await new Promise(resolve => {
+        db.get(`SELECT 1 FROM players WHERE user_id = ? AND guild_id = ?`, [newMember.id, guildId], (err, row) => {
+          if (err) {
+            console.error(`Error checking player registration for ${newMember.id}:`, err);
+            resolve(false);
+          } else {
+            resolve(!!row);
+          }
+        });
+      });
+
+      if (!isRegistered) continue; // Skip unregistered players
+
+      players.push(`<@${newMember.id}>`);
+      count++;
+      embed = EmbedBuilder.from(embed)
+        .setDescription(`**Players:**\n${players.join('\n')}\n\n**Count:** ${count}/10`)
+        .setFooter({ text: `@${newMember.displayName} joined the queue` });
+      await queueMsg.edit({ embeds: [embed] });
+
+      if (count === 10) {
+        await createMatch(db, channel, players, guildId);
+      }
+    } else if (hadRole && !hasRole) {
+      // Member lost the role
+      const index = players.indexOf(`<@${newMember.id}>`);
+      if (index === -1) continue; // Not in queue
+
+      players.splice(index, 1);
+      count--;
+      embed = EmbedBuilder.from(embed)
+        .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${count}/10`)
+        .setFooter({ text: `@${newMember.displayName} left the queue` });
+      await queueMsg.edit({ embeds: [embed] });
     }
   }
 });
