@@ -1,6 +1,17 @@
 const { Client, EmbedBuilder, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
 
+const http = require('http');
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('Bot is online!');
+});
+
+server.listen(process.env.PORT || 3000, () => {
+  console.log('HTTP server running on port', process.env.PORT || 3000);
+});
+
 // Define client globally
 const client = new Client({ intents: ['Guilds', 'GuildMessages', 'MessageContent', 'GuildMembers'] });
 
