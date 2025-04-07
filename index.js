@@ -1,6 +1,5 @@
 const { Client, EmbedBuilder, SlashCommandBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const sqlite3 = require('sqlite3').verbose();
-const config = require('./config.json');
 
 // Define client globally
 const client = new Client({ intents: ['Guilds', 'GuildMessages', 'MessageContent', 'GuildMembers'] });
@@ -1561,4 +1560,4 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   }
 });
 
-client.login(config.token);
+client.login(process.env.TOKEN);

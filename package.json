@@ -1,0 +1,26 @@
+{
+  "name": "stat-track",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GuilleMGN/stat-track.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/GuilleMGN/stat-track/issues"
+  },
+  "homepage": "https://github.com/GuilleMGN/stat-track#readme",
+  "description": "",
+  "dependencies": {
+    "discord.js": "^14.18.0",
+    "mongoose": "^8.13.2",
+    "sqlite3": "^5.1.7"
+  }
+}
