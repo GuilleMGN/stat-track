@@ -76,24 +76,43 @@ const getDb = (guildId) => {
 };
 
 const assignRankedRole = async (db, guild, userId, elo) => {
-  const ranks = await new Promise((resolve, reject) => {
-    db.all(`SELECT role_id, start_elo FROM ranks WHERE guild_id = ? ORDER BY start_elo DESC`, [guild.id], (err, rows) => {
-      if (err) reject(err);
-      else resolve(rows);
-    });
+  const ranks = await new Promise(resolve => {
+    db.all(`SELECT role_id, start_elo FROM ranks WHERE guild_id = ? ORDER BY start_elo DESC`, [guild.id], (err, rows) => resolve(rows || []));
   });
-  const member = guild.members.cache.get(userId);
+  const newRank = ranks.find(rank => elo >= rank.start_elo)?.role_id;
+
+  let member;
+  try {
+    member = guild.members.cache.get(userId) || (await guild.members.fetch(userId));
+  } catch (error) {
+    console.error(`Failed to fetch member ${userId} for role assignment in guild ${guild.id}:`, error);
+    return;
+  }
+
+  if (!member) {
+    console.error(`Member ${userId} not found in guild ${guild.id}`);
+    return;
+  }
+
   const currentRoles = member.roles.cache.filter(role => ranks.some(rank => rank.role_id === role.id));
-  currentRoles.forEach(role => member.roles.remove(role.id).catch(console.error));
-  const applicableRank = ranks.find(rank => elo >= rank.start_elo);
-  if (applicableRank) {
-    member.roles.add(applicableRank.role_id).catch(console.error);
+  if (newRank && !currentRoles.has(newRank)) {
+    const rolesToRemove = currentRoles.filter(role => role.id !== newRank);
+    await member.roles.remove(rolesToRemove).catch(console.error);
+    await member.roles.add(newRank).catch(console.error);
+  } else if (!newRank && currentRoles.size > 0) {
+    await member.roles.remove(currentRoles).catch(console.error);
   }
 };
 
 const getNextMatchNumber = (db, guildId) => new Promise(resolve => {
   db.get(`SELECT MAX(match_number) as max FROM matches WHERE guild_id = ?`, [guildId], (err, row) => {
-    resolve((row?.max || 0) + 1);
+    if (err) {
+      console.error(`Error getting next match number for guild ${guildId}:`, err);
+      return resolve(1); // Fallback to 1 if query fails
+    }
+    const nextNumber = (row?.max || 0) + 1;
+    console.log(`Next match number for guild ${guildId}: ${nextNumber}`);
+    resolve(nextNumber);
   });
 });
 
@@ -112,7 +131,10 @@ const getRandomMap = (db, guildId) => new Promise(resolve => {
 const updatePlayerEloAndRank = async (db, guild, userId, eloChange, isMvp, bonus, channelId) => {
   return new Promise((resolve) => {
     db.get(`SELECT elo, name FROM players WHERE user_id = ? AND guild_id = ?`, [userId, guild.id], async (err, row) => {
-      if (err || !row) return resolve({ oldElo: 0, newElo: 0, name: 'Unknown' });
+      if (err || !row) {
+        console.error(`Error fetching player ${userId} in guild ${guild.id}:`, err);
+        return resolve({ oldElo: 0, newElo: 0, name: 'Unknown' });
+      }
       const oldElo = row.elo;
       let newElo = Math.max(0, oldElo + eloChange); // Prevent negative Elo
       if (isMvp) {
@@ -127,6 +149,16 @@ const updatePlayerEloAndRank = async (db, guild, userId, eloChange, isMvp, bonus
       const oldRank = await new Promise(resolve => {
         db.get(`SELECT role_id FROM ranks WHERE start_elo <= ? AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [oldElo, guild.id], (err, row) => resolve(row?.role_id));
       });
+
+      // Fetch the member if not in cache
+      let member;
+      try {
+        member = guild.members.cache.get(userId) || (await guild.members.fetch(userId));
+      } catch (error) {
+        console.error(`Failed to fetch member ${userId} in guild ${guild.id}:`, error);
+        return resolve({ oldElo, newElo, name: row.name }); // Skip role updates if member fetch fails
+      }
+
       await assignRankedRole(db, guild, userId, newElo);
       const newRank = await new Promise(resolve => {
         db.get(`SELECT role_id FROM ranks WHERE start_elo <= ? AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [newElo, guild.id], (err, row) => resolve(row?.role_id));
@@ -242,6 +274,7 @@ const commands = [
     .addIntegerOption(option => option.setName('match_id').setDescription('The match number to undo').setRequired(true)),
   new SlashCommandBuilder().setName('set_updates_channel').setDescription('Set the rank updates channel (Mods only)')
     .addChannelOption(option => option.setName('channel_id').setDescription('The channel for rank updates').setRequired(true)),
+  new SlashCommandBuilder().setName('reset_season').setDescription('Reset all match and player statistics (Mods only)'),
 ].map(command => command.toJSON());
 
 client.once('ready', async () => {
@@ -393,7 +426,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (commandName === 'score') {
-      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', flags: [4096] });
       const matchId = options.getInteger('match_id');
       const winnerTeam = options.getInteger('winner_team');
       const mvp1 = options.getUser('mvp1');
@@ -439,8 +472,12 @@ client.on('interactionCreate', async (interaction) => {
           eloChanges.push(`[${oldElo}] -> [${newElo}] ${name}`);
         }
 
+        // Save match result details
         db.run(`UPDATE matches SET scored = 1, winner_team = ?, mvp1 = ?, mvp2 = ?, bonus = ? WHERE match_number = ? AND guild_id = ?`,
-          [winnerTeam, mvp1?.id, mvp2?.id, bonus, matchId, interaction.guildId]);
+          [winnerTeam, mvp1?.id || null, mvp2?.id || null, bonus, matchId, interaction.guildId], err => {
+            if (err) console.error(`Error updating match #${matchId} with result details:`, err);
+          });
+
         const embed = new EmbedBuilder()
           .setTitle(`Match #${matchId} Results`)
           .setDescription(eloChanges.join('\n'))
@@ -451,7 +488,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (commandName === 'sub') {
-      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', flags: [4096] });
       const matchId = options.getInteger('match_id');
       const oldPlayer = options.getUser('old_player');
       const newPlayer = options.getUser('new_player');
@@ -483,9 +520,9 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (commandName === 'undo') {
-      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', flags: [4096] });
       const matchId = options.getInteger('match_id');
-      db.get(`SELECT ct_team, tr_team, scored, guild_id FROM matches WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId], async (err, row) => {
+      db.get(`SELECT ct_team, tr_team, scored, guild_id, winner_team, mvp1, mvp2, bonus FROM matches WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId], async (err, row) => {
         if (err) {
           console.error('Error querying match for undo:', err);
           return interaction.reply(`Error checking Match #${matchId}!`);
@@ -495,9 +532,15 @@ client.on('interactionCreate', async (interaction) => {
 
         const ctTeam = row.ct_team.split(',').map(id => id.trim().replace(/<@|>/g, '')); // Strip <@ and >
         const trTeam = row.tr_team.split(',').map(id => id.trim().replace(/<@|>/g, '')); // Strip <@ and >
-        const allPlayers = [...ctTeam, ...trTeam];
+        const winningTeam = row.winner_team === 1 ? ctTeam : trTeam;
+        const losingTeam = row.winner_team === 1 ? trTeam : ctTeam;
+        const mvp1 = row.mvp1;
+        const mvp2 = row.mvp2;
+        const bonus = row.bonus || 0;
+
         const eloChanges = [];
-        for (const userId of allPlayers) {
+        // Undo for winners
+        for (const userId of winningTeam) {
           const playerData = await new Promise(resolve => {
             db.get(`SELECT elo, name FROM players WHERE user_id = ? AND guild_id = ?`, [userId, interaction.guildId], (err, row) => {
               if (err) {
@@ -513,14 +556,71 @@ client.on('interactionCreate', async (interaction) => {
             continue;
           }
           const { elo: currentElo, name } = playerData;
-          // For now, we can't accurately undo without history; set Elo back to itself as a placeholder
-          const newElo = currentElo; // TODO: Implement proper undo logic
+          const rank = await new Promise(resolve => {
+            db.get(`SELECT win_elo FROM ranks WHERE start_elo <= ? AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [currentElo, interaction.guildId], (err, row) => resolve(row));
+          });
+          const winElo = rank?.win_elo || 0;
+          let eloChange = -winElo; // Reverse the win Elo
+          const isMvp = (userId === mvp1 || userId === mvp2);
+          if (isMvp) {
+            const mvpElo = await new Promise(resolve => {
+              db.get(`SELECT mvp_elo FROM ranks WHERE start_elo <= ? AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [currentElo, interaction.guildId], (err, row) => resolve(row?.mvp_elo || 0));
+            });
+            eloChange -= mvpElo; // Reverse MVP bonus
+          }
+          eloChange -= bonus; // Reverse queue bonus
+          const newElo = Math.max(0, currentElo + eloChange);
+          db.run(`UPDATE players SET elo = ? WHERE user_id = ? AND guild_id = ?`, [newElo, userId, interaction.guildId]);
+          await assignRankedRole(db, interaction.guild, userId, newElo);
+          eloChanges.push(`[${currentElo}] -> [${newElo}] ${name}`);
+        }
+        // Undo for losers
+        for (const userId of losingTeam) {
+          const playerData = await new Promise(resolve => {
+            db.get(`SELECT elo, name FROM players WHERE user_id = ? AND guild_id = ?`, [userId, interaction.guildId], (err, row) => {
+              if (err) {
+                console.error(`Error fetching player ${userId}:`, err);
+                resolve(null);
+              } else {
+                resolve(row);
+              }
+            });
+          });
+          if (!playerData) {
+            eloChanges.push(`[N/A] -> [N/A] Unknown (${userId})`);
+            continue;
+          }
+          const { elo: currentElo, name } = playerData;
+          const rank = await new Promise(resolve => {
+            db.get(`SELECT loss_elo FROM ranks WHERE start_elo <= ? AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [currentElo, interaction.guildId], (err, row) => resolve(row));
+          });
+          const lossElo = rank?.loss_elo || 0;
+          // Simulate the original /score logic to determine if Elo actually changed
+          const simulatedOldElo = currentElo; // Current Elo after /score
+          const simulatedScoreChange = -(lossElo);
+          const simulatedNewEloDuringScore = Math.max(0, simulatedOldElo + simulatedScoreChange); // What /score set it to
+          let eloChange = 0;
+          if (simulatedNewEloDuringScore < simulatedOldElo) {
+            // If /score actually reduced the Elo, reverse it
+            eloChange = lossElo; // Add back the lossElo (e.g., +22)
+          }
+          // Note: No bonus or MVP for losers in this case, but include if applicable
+          const isMvp = (userId === mvp1 || userId === mvp2);
+          if (isMvp) {
+            const mvpElo = await new Promise(resolve => {
+              db.get(`SELECT mvp_elo FROM ranks WHERE start_elo <= ? AND guild_id = ? ORDER BY start_elo DESC LIMIT 1`, [currentElo, interaction.guildId], (err, row) => resolve(row?.mvp_elo || 0));
+            });
+            eloChange -= mvpElo; // Reverse MVP bonus
+          }
+          const newElo = Math.max(0, currentElo + eloChange);
           db.run(`UPDATE players SET elo = ? WHERE user_id = ? AND guild_id = ?`, [newElo, userId, interaction.guildId]);
           await assignRankedRole(db, interaction.guild, userId, newElo);
           eloChanges.push(`[${currentElo}] -> [${newElo}] ${name}`);
         }
 
-        db.run(`UPDATE matches SET scored = 0 WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId]);
+        // Mark match as unscored and clear result details
+        db.run(`UPDATE matches SET scored = 0, winner_team = NULL, mvp1 = NULL, mvp2 = NULL, bonus = NULL WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId]);
+
         const embed = new EmbedBuilder()
           .setTitle(`Match #${matchId} Undo Results`)
           .setDescription(eloChanges.length > 0 ? eloChanges.join('\n') : 'No Elo changes applied (players not found).')
@@ -531,7 +631,7 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (commandName === 'set_updates_channel') {
-      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', flags: [4096] });
       const channel = options.getChannel('channel_id');
       if (channel.type !== 0) return interaction.reply('Please select a text channel!');
       db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES ('updates_channel', ?, ?)`, [channel.id, interaction.guildId], err => {
@@ -842,6 +942,24 @@ client.on('interactionCreate', async (interaction) => {
       });
     }
 
+    if (commandName === 'reset_season') {
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', flags: [4096] });
+
+      const embed = new EmbedBuilder()
+        .setTitle('Reset Season Confirmation')
+        .setDescription('You are about to reset all statistics:\n- All matches will be cleared (reverting to 0 matches played).\n- All player Elos will be reset to 0.\n- Player stats (wins, losses, MVPs) will be reset to default values.\n\n**Would you still like to proceed?**')
+        .setColor('#ff0000')
+        .setTimestamp();
+
+      const row = new ActionRowBuilder()
+        .addComponents(
+          new ButtonBuilder().setCustomId('reset_season_yes').setLabel('Yes').setStyle(ButtonStyle.Danger),
+          new ButtonBuilder().setCustomId('reset_season_no').setLabel('No').setStyle(ButtonStyle.Secondary)
+        );
+
+      await interaction.reply({ embeds: [embed], components: [row] });
+    }
+
     if (commandName === 'set_results_channel') {
       if (!isMod) return interaction.reply('Only moderators can use this command!');
       const channel = options.getChannel('channel_id');
@@ -859,7 +977,7 @@ client.on('interactionCreate', async (interaction) => {
     if (customId.startsWith('approve_') || customId.startsWith('decline_') || customId.startsWith('help_')) {
       const [action, userId] = customId.split('_');
       if (!isMod && (action === 'approve' || action === 'decline')) {
-        return interaction.reply({ content: 'Only moderators can approve/decline registrations!', ephemeral: true });
+        return interaction.reply({ content: 'Only moderators can approve/decline registrations!', flags: [4096] });
       }
       if (!isMod && action === 'help') {
         return interaction.reply('Please include a screenshot of your common statistics (with hours)');
@@ -951,7 +1069,7 @@ client.on('interactionCreate', async (interaction) => {
           });
 
           if (!isRegistered) {
-            await interaction.followUp({ content: 'You must register using /register before joining the queue!', ephemeral: true });
+            await interaction.followUp({ content: 'You must register using /register before joining the queue!', flags: [4096] });
             return;
           }
 
@@ -988,77 +1106,82 @@ client.on('interactionCreate', async (interaction) => {
     }
 
     if (customId === 'next_match' || customId === 'maps' || customId === 'teams') {
-      if (!isMod) return interaction.reply({ content: 'Only moderators can use this!', ephemeral: true });
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this!', flags: [4096] });
 
       const matchEmbed = interaction.message.embeds[0];
       if (!matchEmbed || !matchEmbed.title || !matchEmbed.title.match(/Match #\d+/)) {
-        return interaction.reply({ content: 'Invalid match embed!', ephemeral: true });
+        return interaction.reply({ content: 'Invalid match embed!', flags: [4096] });
       }
 
       try {
         if (customId === 'next_match') {
-          const matchNumberMatch = matchEmbed.title.match(/#(\d+)/);
-          if (!matchNumberMatch) throw new Error('Could not extract match number from title');
-          const matchNumber = matchNumberMatch[1];
+          try {
+            const matchNumberMatch = matchEmbed.title.match(/#(\d+)/);
+            if (!matchNumberMatch) throw new Error('Could not extract match number from title');
+            const matchNumber = matchNumberMatch[1];
 
-          const ctMatch = matchEmbed.description.match(/\*\*CT Team 1:\*\*\n([\s\S]*?)\n\n\*\*TR Team 2:/);
-          const trMatch = matchEmbed.description.match(/\*\*TR Team 2:\*\*\n([\s\S]*?)\n\n\*\*Map:/);
-          const mapMatch = matchEmbed.description.match(/\*\*Map:\*\* (.*)/);
-          if (!ctMatch || !trMatch || !mapMatch) throw new Error('Invalid embed description format for teams or map');
+            const ctMatch = matchEmbed.description.match(/\*\*CT Team 1:\*\*\n([\s\S]*?)\n\n\*\*TR Team 2:/);
+            const trMatch = matchEmbed.description.match(/\*\*TR Team 2:\*\*\n([\s\S]*?)\n\n\*\*Map:/);
+            const mapMatch = matchEmbed.description.match(/\*\*Map:\*\* (.*)/);
+            if (!ctMatch || !trMatch || !mapMatch) throw new Error('Invalid embed description format for teams or map');
 
-          const ctTeam = ctMatch[1].split('\n').filter(line => line.trim());
-          const trTeam = trMatch[1].split('\n').filter(line => line.trim());
-          const map = mapMatch[1];
+            const ctTeam = ctMatch[1].split('\n').filter(line => line.trim()).map(id => id.replace(/<@|>/g, '')); // Clean IDs
+            const trTeam = trMatch[1].split('\n').filter(line => line.trim()).map(id => id.replace(/<@|>/g, '')); // Clean IDs
+            const map = mapMatch[1];
 
-          // Log match to results channel
-          await new Promise((resolve, reject) => {
-            db.run(`INSERT INTO matches (match_number, ct_team, tr_team, map, guild_id) VALUES (?, ?, ?, ?, ?)`,
-              [matchNumber, ctTeam.join(','), trTeam.join(','), map, guildId], err => {
-                if (err) {
-                  console.error(`Error inserting match #${matchNumber}:`, err);
-                  reject(err);
-                } else {
-                  console.log(`Match #${matchNumber} saved to database`);
-                  resolve();
-                }
-              });
-          });
+            // Log match to results channel
+            await new Promise((resolve, reject) => {
+              db.run(`INSERT INTO matches (match_number, ct_team, tr_team, map, guild_id) VALUES (?, ?, ?, ?, ?)`,
+                [matchNumber, ctTeam.join(','), trTeam.join(','), map, guildId], err => {
+                  if (err) {
+                    console.error(`Error inserting match #${matchNumber}:`, err);
+                    reject(err);
+                  } else {
+                    console.log(`Match #${matchNumber} saved to database`);
+                    resolve();
+                  }
+                });
+            });
 
-          const resultsChannelId = await new Promise(resolve => {
-            db.get(`SELECT value FROM settings WHERE key = 'results_channel' AND guild_id = ?`, [guildId], (err, row) => resolve(row?.value));
-          });
-          if (resultsChannelId) {
-            const resultsChannel = interaction.guild.channels.cache.get(resultsChannelId);
-            if (resultsChannel) await resultsChannel.send({ embeds: [matchEmbed] });
+            const resultsChannelId = await new Promise(resolve => {
+              db.get(`SELECT value FROM settings WHERE key = 'results_channel' AND guild_id = ?`, [guildId], (err, row) => resolve(row?.value));
+            });
+            if (resultsChannelId) {
+              const resultsChannel = interaction.guild.channels.cache.get(resultsChannelId);
+              if (resultsChannel) await resultsChannel.send({ embeds: [matchEmbed] });
+            }
+
+            const disabledRow = new ActionRowBuilder()
+              .addComponents(
+                new ButtonBuilder().setCustomId('next_match').setLabel('Next').setStyle(ButtonStyle.Success).setDisabled(true),
+                new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary).setDisabled(true),
+                new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary).setDisabled(true)
+              );
+            await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
+
+            const queueTitle = await new Promise(resolve => {
+              db.get(`SELECT title FROM queues WHERE channel_id = ? AND guild_id = ?`, [channelId, guildId], (err, row) => resolve(row?.title || 'Matchmaking Queue'));
+            });
+            const newQueueEmbed = new EmbedBuilder()
+              .setTitle(queueTitle)
+              .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
+              .setColor('#0099ff')
+              .setFooter({ text: 'New queue started' })
+              .setTimestamp();
+            const queueRow = new ActionRowBuilder()
+              .addComponents(
+                new ButtonBuilder().setCustomId('join_queue').setLabel('Join').setStyle(ButtonStyle.Primary),
+                new ButtonBuilder().setCustomId('leave_queue').setLabel('Leave').setStyle(ButtonStyle.Danger),
+                new ButtonBuilder().setCustomId('clear_queue').setLabel('Clear').setStyle(ButtonStyle.Secondary)
+              );
+            const newQueueMsg = await interaction.channel.send({ embeds: [newQueueEmbed], components: [queueRow] });
+            db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${channelId}`, newQueueMsg.id, guildId]);
+
+            await interaction.deferUpdate();
+          } catch (error) {
+            console.error(`Button handler error (next_match):`, error);
+            await interaction.reply({ content: 'An error occurred while processing this action!', flags: [4096] });
           }
-
-          const disabledRow = new ActionRowBuilder()
-            .addComponents(
-              new ButtonBuilder().setCustomId('next_match').setLabel('Next').setStyle(ButtonStyle.Success).setDisabled(true),
-              new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary).setDisabled(true),
-              new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary).setDisabled(true)
-            );
-          await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
-
-          const queueTitle = await new Promise(resolve => {
-            db.get(`SELECT title FROM queues WHERE channel_id = ? AND guild_id = ?`, [channelId, guildId], (err, row) => resolve(row?.title || 'Matchmaking Queue'));
-          });
-          const newQueueEmbed = new EmbedBuilder()
-            .setTitle(queueTitle)
-            .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
-            .setColor('#0099ff')
-            .setFooter({ text: 'New queue started' })
-            .setTimestamp();
-          const queueRow = new ActionRowBuilder()
-            .addComponents(
-              new ButtonBuilder().setCustomId('join_queue').setLabel('Join').setStyle(ButtonStyle.Primary),
-              new ButtonBuilder().setCustomId('leave_queue').setLabel('Leave').setStyle(ButtonStyle.Danger),
-              new ButtonBuilder().setCustomId('clear_queue').setLabel('Clear').setStyle(ButtonStyle.Secondary)
-            );
-          const newQueueMsg = await interaction.channel.send({ embeds: [newQueueEmbed], components: [queueRow] });
-          db.run(`INSERT OR REPLACE INTO settings (key, value, guild_id) VALUES (?, ?, ?)`, [`queue_message_${channelId}`, newQueueMsg.id, guildId]);
-
-          await interaction.deferUpdate();
         }
 
         if (customId === 'maps') {
@@ -1089,7 +1212,136 @@ client.on('interactionCreate', async (interaction) => {
         }
       } catch (error) {
         console.error(`Button handler error (${customId}):`, error);
-        await interaction.reply({ content: 'An error occurred while processing this action!', ephemeral: true });
+        await interaction.reply({ content: 'An error occurred while processing this action!', flags: [4096] });
+      }
+    }
+
+    if (customId === 'reset_season_yes' || customId === 'reset_season_no') {
+      if (!isMod) return interaction.reply({ content: 'Only moderators can confirm this action!', flags: [4096] });
+
+      // Defer the interaction to prevent timeout
+      await interaction.deferUpdate();
+
+      const embed = interaction.message.embeds[0];
+
+      // Disable the buttons after an action is taken
+      const disabledRow = new ActionRowBuilder()
+        .addComponents(
+          new ButtonBuilder().setCustomId('reset_season_yes').setLabel('Yes').setStyle(ButtonStyle.Danger).setDisabled(true),
+          new ButtonBuilder().setCustomId('reset_season_no').setLabel('No').setStyle(ButtonStyle.Secondary).setDisabled(true)
+        );
+
+      if (customId === 'reset_season_yes') {
+        try {
+          // Reset all matches
+          await new Promise((resolve, reject) => {
+            db.run(`DELETE FROM matches WHERE guild_id = ?`, [guildId], err => {
+              if (err) {
+                console.error(`Error deleting matches for guild ${guildId}:`, err);
+                reject(err);
+              } else {
+                console.log(`Matches deleted for guild ${guildId}`);
+                resolve();
+              }
+            });
+          });
+
+          // Reset all player stats (elo, wins, losses, mvps) while keeping players registered
+          await new Promise((resolve, reject) => {
+            db.run(`UPDATE players SET elo = 0, wins = 0, losses = 0, mvps = 0 WHERE guild_id = ?`, [guildId], err => {
+              if (err) {
+                console.error(`Error resetting player stats for guild ${guildId}:`, err);
+                reject(err);
+              } else {
+                console.log(`Player stats reset for guild ${guildId}`);
+                resolve();
+              }
+            });
+          });
+
+          // Fetch rank roles to remove existing ones
+          const rankRoles = await new Promise(resolve => {
+            db.all(`SELECT role_id FROM ranks WHERE guild_id = ?`, [guildId], (err, rows) => {
+              if (err) {
+                console.error(`Error fetching rank roles for guild ${guildId}:`, err);
+                resolve([]);
+              } else {
+                resolve(rows?.map(row => row.role_id) || []);
+              }
+            });
+          });
+
+          // Fetch all players
+          const players = await new Promise(resolve => {
+            db.all(`SELECT user_id FROM players WHERE guild_id = ?`, [guildId], (err, rows) => {
+              if (err) {
+                console.error(`Error fetching players for guild ${guildId}:`, err);
+                resolve([]);
+              } else {
+                resolve(rows || []);
+              }
+            });
+          });
+
+          // Process each player: remove rank roles, update nickname, and reassign rank role
+          for (const player of players) {
+            try {
+              const member = interaction.guild.members.cache.get(player.user_id) || (await interaction.guild.members.fetch(player.user_id));
+              if (member) {
+                // Remove existing rank roles
+                await member.roles.remove(rankRoles).catch(err => console.error(`Failed to remove roles for user ${player.user_id}:`, err));
+
+                // Update nickname to reflect new Elo (0)
+                const playerData = await new Promise(resolve => {
+                  db.get(`SELECT name FROM players WHERE user_id = ? AND guild_id = ?`, [player.user_id, guildId], (err, row) => {
+                    if (err) {
+                      console.error(`Error fetching player data for user ${player.user_id}:`, err);
+                      resolve(null);
+                    } else {
+                      resolve(row);
+                    }
+                  });
+                });
+
+                if (playerData) {
+                  try {
+                    await member.setNickname(`0 | ${playerData.name}`);
+                  } catch (error) {
+                    if (error.code === 50013) { // DiscordAPIError: Missing Permissions
+                      console.log(`Skipped nickname update for user ${player.user_id} due to missing permissions (likely server owner).`);
+                    } else {
+                      console.error(`Failed to update nickname for user ${player.user_id}:`, error);
+                    }
+                  }
+                }
+
+                // Reassign rank role based on new Elo (0)
+                await assignRankedRole(db, interaction.guild, player.user_id, 0);
+              }
+            } catch (error) {
+              console.error(`Failed to process user ${player.user_id} during season reset:`, error);
+            }
+          }
+
+          const updatedEmbed = EmbedBuilder.from(embed)
+            .setDescription('Season has been reset successfully!\n- All matches have been cleared.\n- All player Elos and stats have been reset.')
+            .setColor('#00ff00');
+
+          await interaction.editReply({ embeds: [updatedEmbed], components: [disabledRow] });
+        } catch (error) {
+          console.error(`Error during season reset for guild ${guildId}:`, error);
+          const errorEmbed = EmbedBuilder.from(embed)
+            .setDescription('An error occurred while resetting the season. Please check the logs for details.')
+            .setColor('#ff0000');
+
+          await interaction.editReply({ embeds: [errorEmbed], components: [disabledRow] });
+        }
+      } else if (customId === 'reset_season_no') {
+        const updatedEmbed = EmbedBuilder.from(embed)
+          .setDescription('Season reset has been canceled.')
+          .setColor('#ff0000');
+
+        await interaction.editReply({ embeds: [updatedEmbed], components: [disabledRow] });
       }
     }
   }
