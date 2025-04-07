@@ -2,21 +2,28 @@ const { Client, EmbedBuilder, SlashCommandBuilder, ActionRowBuilder, ButtonBuild
 const sqlite3 = require('sqlite3').verbose();
 const config = require('./config.json');
 
+// Define client globally
 const client = new Client({ intents: ['Guilds', 'GuildMessages', 'MessageContent', 'GuildMembers'] });
 
+// Cache for database instances
+const dbCache = new Map();
+
 const getDb = (guildId) => {
+  if (dbCache.has(guildId)) {
+    return dbCache.get(guildId);
+  }
+
   const db = new sqlite3.Database(`./maps_${guildId}.db`, (err) => {
     if (err) console.error(`Database error for guild ${guildId}:`, err);
     console.log(`Connected to SQLite database for guild ${guildId}.`);
   });
 
   db.serialize(() => {
-    // Create all tables
     db.run(`CREATE TABLE IF NOT EXISTS maps (map_name TEXT UNIQUE, guild_id TEXT, PRIMARY KEY (map_name, guild_id))`);
     db.run(`CREATE TABLE IF NOT EXISTS players (user_id TEXT, name TEXT UNIQUE, elo INTEGER DEFAULT 0, wins INTEGER DEFAULT 0, losses INTEGER DEFAULT 0, mvps INTEGER DEFAULT 0, guild_id TEXT, PRIMARY KEY (user_id, guild_id))`);
     db.run(`CREATE TABLE IF NOT EXISTS settings (key TEXT, value TEXT, guild_id TEXT, PRIMARY KEY (key, guild_id))`);
     db.run(`CREATE TABLE IF NOT EXISTS ranks (role_id TEXT, start_elo INTEGER, win_elo INTEGER, loss_elo INTEGER, mvp_elo INTEGER, guild_id TEXT, PRIMARY KEY (role_id, guild_id))`);
-    db.run(`CREATE TABLE IF NOT EXISTS matches (match_number INTEGER, ct_team TEXT, tr_team TEXT, map TEXT, guild_id TEXT, scored INTEGER DEFAULT 0, PRIMARY KEY (match_number, guild_id))`);
+    db.run(`CREATE TABLE IF NOT EXISTS matches (match_number INTEGER, ct_team TEXT, tr_team TEXT, map TEXT, guild_id TEXT, scored INTEGER DEFAULT 0, winner_team INTEGER, mvp1 TEXT, mvp2 TEXT, bonus INTEGER, PRIMARY KEY (match_number, guild_id))`);
     db.run(`CREATE TABLE IF NOT EXISTS queues (channel_id TEXT, guild_id TEXT, title TEXT, PRIMARY KEY (channel_id, guild_id))`);
 
     // Check and update queues table schema
@@ -25,7 +32,7 @@ const getDb = (guildId) => {
         console.error('Error checking queues schema:', err);
         return;
       }
-      const columns = rows || []; // Default to empty array if undefined
+      const columns = rows || [];
       const hasTitle = columns.some(row => row.name === 'title');
       if (!hasTitle) {
         db.run(`ALTER TABLE queues ADD COLUMN title TEXT`, err => {
@@ -34,8 +41,37 @@ const getDb = (guildId) => {
         });
       }
     });
+
+    db.all(`PRAGMA table_info(matches)`, (err, rows) => {
+      if (err) {
+        console.error('Error checking matches schema:', err);
+        return;
+      }
+      const columns = rows || [];
+      const hasScored = columns.some(row => row.name === 'scored');
+      const hasWinnerTeam = columns.some(row => row.name === 'winner_team');
+      const hasMvp1 = columns.some(row => row.name === 'mvp1');
+      const hasMvp2 = columns.some(row => row.name === 'mvp2');
+      const hasBonus = columns.some(row => row.name === 'bonus');
+      if (!hasScored) {
+        db.run(`ALTER TABLE matches ADD COLUMN scored INTEGER DEFAULT 0`);
+      }
+      if (!hasWinnerTeam) {
+        db.run(`ALTER TABLE matches ADD COLUMN winner_team INTEGER`);
+      }
+      if (!hasMvp1) {
+        db.run(`ALTER TABLE matches ADD COLUMN mvp1 TEXT`);
+      }
+      if (!hasMvp2) {
+        db.run(`ALTER TABLE matches ADD COLUMN mvp2 TEXT`);
+      }
+      if (!hasBonus) {
+        db.run(`ALTER TABLE matches ADD COLUMN bonus INTEGER`);
+      }
+    });
   });
 
+  dbCache.set(guildId, db);
   return db;
 };
 
@@ -135,6 +171,17 @@ const createMatch = async (db, channel, players, guildId) => {
     .setDescription(`**Players:**\nNone\n\n**Count:** 0/10`)
     .setFooter({ text: 'Match created, queue reset' });
   await queueMsg.edit({ embeds: [resetEmbed] });
+
+  // Clean player IDs before saving to matches table
+  const cleanCtTeam = ctTeam.map(id => id.replace(/<@|>/g, ''));
+  const cleanTrTeam = trTeam.map(id => id.replace(/<@|>/g, ''));
+  await new Promise((resolve, reject) => {
+    db.run(`INSERT INTO matches (match_number, ct_team, tr_team, map, guild_id) VALUES (?, ?, ?, ?, ?)`,
+      [matchNumber, cleanCtTeam.join(','), cleanTrTeam.join(','), map, guildId], err => {
+        if (err) reject(err);
+        else resolve();
+      });
+  });
 };
 
 const commands = [
@@ -224,7 +271,7 @@ client.on('interactionCreate', async (interaction) => {
     const { commandName, options } = interaction;
 
     if (commandName === 'force_register') {
-      if (!avançadoisMod) return interaction.reply('Only moderators can use this command!');
+      if (!isMod) return interaction.reply('Only moderators can use this command!'); // Fixed typo here
       const targetUser = options.getUser('user');
       const playerName = options.getString('player_name');
       const userId = targetUser.id;
@@ -353,12 +400,18 @@ client.on('interactionCreate', async (interaction) => {
       const mvp2 = options.getUser('mvp2');
       if (winnerTeam !== 1 && winnerTeam !== 2) return interaction.reply('Winner team must be 1 or 2!');
 
+      console.log(`Scoring match: matchId=${matchId}, guildId=${interaction.guildId}`);
       db.get(`SELECT ct_team, tr_team, scored, guild_id FROM matches WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId], async (err, row) => {
-        if (err || !row) return interaction.reply(`Match #${matchId} not found!`);
+        if (err) {
+          console.error('Error querying match:', err);
+          return interaction.reply(`Error checking Match #${matchId}!`);
+        }
+        console.log(`Query result:`, row);
+        if (!row) return interaction.reply(`Match #${matchId} not found!`);
         if (row.scored) return interaction.reply(`Match #${matchId} has already been scored!`);
 
-        const ctTeam = row.ct_team.split(',').map(id => id.trim());
-        const trTeam = row.tr_team.split(',').map(id => id.trim());
+        const ctTeam = row.ct_team.split(',').map(id => id.trim().replace(/<@|>/g, '')); // Strip <@ and >
+        const trTeam = row.tr_team.split(',').map(id => id.trim().replace(/<@|>/g, '')); // Strip <@ and >
         const winningTeam = winnerTeam === 1 ? ctTeam : trTeam;
         const losingTeam = winnerTeam === 1 ? trTeam : ctTeam;
 
@@ -386,7 +439,8 @@ client.on('interactionCreate', async (interaction) => {
           eloChanges.push(`[${oldElo}] -> [${newElo}] ${name}`);
         }
 
-        db.run(`UPDATE matches SET scored = 1 WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId]);
+        db.run(`UPDATE matches SET scored = 1, winner_team = ?, mvp1 = ?, mvp2 = ?, bonus = ? WHERE match_number = ? AND guild_id = ?`,
+          [winnerTeam, mvp1?.id, mvp2?.id, bonus, matchId, interaction.guildId]);
         const embed = new EmbedBuilder()
           .setTitle(`Match #${matchId} Results`)
           .setDescription(eloChanges.join('\n'))
@@ -431,35 +485,47 @@ client.on('interactionCreate', async (interaction) => {
     if (commandName === 'undo') {
       if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
       const matchId = options.getInteger('match_id');
+      db.get(`SELECT ct_team, tr_team, scored, guild_id FROM matches WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId], async (err, row) => {
+        if (err) {
+          console.error('Error querying match for undo:', err);
+          return interaction.reply(`Error checking Match #${matchId}!`);
+        }
+        if (!row) return interaction.reply(`Match #${matchId} not found!`);
+        if (!row.scored) return interaction.reply(`Match #${matchId} has not been scored!`);
 
-      db.get(`SELECT ct_team, tr_team, scored FROM matches WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId], async (err, row) => {
-        if (err || !row) return interaction.reply(`Match #${matchId} not found!`);
-        if (!row.scored) return interaction.reply(`Match #${matchId} has not been scored yet!`);
-
-        const ctTeam = row.ct_team.split(',');
-        const trTeam = row.tr_team.split(',');
+        const ctTeam = row.ct_team.split(',').map(id => id.trim().replace(/<@|>/g, '')); // Strip <@ and >
+        const trTeam = row.tr_team.split(',').map(id => id.trim().replace(/<@|>/g, '')); // Strip <@ and >
         const allPlayers = [...ctTeam, ...trTeam];
         const eloChanges = [];
-
         for (const userId of allPlayers) {
-          db.get(`SELECT elo, name FROM players WHERE user_id = ? AND guild_id = ?`, [userId, interaction.guildId], async (err, player) => {
-            if (err || !player) return;
-            const oldElo = player.elo;
-            const originalElo = await new Promise(resolve => {
-              db.get(`SELECT elo FROM players WHERE user_id = ? AND guild_id = ?`, [userId, interaction.guildId], (err, row) => resolve(row?.elo || 0));
+          const playerData = await new Promise(resolve => {
+            db.get(`SELECT elo, name FROM players WHERE user_id = ? AND guild_id = ?`, [userId, interaction.guildId], (err, row) => {
+              if (err) {
+                console.error(`Error fetching player ${userId}:`, err);
+                resolve(null);
+              } else {
+                resolve(row);
+              }
             });
-            db.run(`UPDATE players SET elo = ? WHERE user_id = ? AND guild_id = ?`, [originalElo, userId, interaction.guildId]);
-            await assignRankedRole(db, interaction.guild, userId, originalElo);
-            eloChanges.push(`[${oldElo}] -> [${originalElo}] ${player.name}`);
           });
+          if (!playerData) {
+            eloChanges.push(`[N/A] -> [N/A] Unknown (${userId})`);
+            continue;
+          }
+          const { elo: currentElo, name } = playerData;
+          // For now, we can't accurately undo without history; set Elo back to itself as a placeholder
+          const newElo = currentElo; // TODO: Implement proper undo logic
+          db.run(`UPDATE players SET elo = ? WHERE user_id = ? AND guild_id = ?`, [newElo, userId, interaction.guildId]);
+          await assignRankedRole(db, interaction.guild, userId, newElo);
+          eloChanges.push(`[${currentElo}] -> [${newElo}] ${name}`);
         }
 
         db.run(`UPDATE matches SET scored = 0 WHERE match_number = ? AND guild_id = ?`, [matchId, interaction.guildId]);
         const embed = new EmbedBuilder()
-          .setTitle(`Match #${matchId} Undo`)
-          .setDescription(eloChanges.join('\n'))
+          .setTitle(`Match #${matchId} Undo Results`)
+          .setDescription(eloChanges.length > 0 ? eloChanges.join('\n') : 'No Elo changes applied (players not found).')
           .setColor('#ff0000')
-          .setFooter({ text: `Match #${matchId} scoring has been undone` });
+          .setFooter({ text: `Match #${matchId} has been unscored` });
         interaction.reply({ embeds: [embed] });
       });
     }
@@ -872,6 +938,23 @@ client.on('interactionCreate', async (interaction) => {
         const playerDisplayName = interaction.member.nickname || interaction.user.username;
 
         if (customId === 'join_queue') {
+          const userId = user.id;
+          const isRegistered = await new Promise(resolve => {
+            db.get(`SELECT 1 FROM players WHERE user_id = ? AND guild_id = ?`, [userId, guildId], (err, row) => {
+              if (err) {
+                console.error('Error checking player registration:', err);
+                resolve(false);
+              } else {
+                resolve(!!row);
+              }
+            });
+          });
+
+          if (!isRegistered) {
+            await interaction.followUp({ content: 'You must register using /register before joining the queue!', ephemeral: true });
+            return;
+          }
+
           if (players.includes(`<@${user.id}>`)) return; // Silently exit
           if (count >= 10) return interaction.editReply('Queue is full!');
           players.push(`<@${user.id}>`);
