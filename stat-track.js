@@ -301,77 +301,93 @@ client.on('interactionCreate', async interaction => {
     const { commandName, options } = interaction;
 
     if (commandName === 'force_register') {
-      if (!isMod) return interaction.reply('Only moderators can use this command!');
+      if (!isMod) {
+        return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      }
       const targetUser = options.getUser('user');
       const playerName = options.getString('player_name');
       const userId = targetUser.id;
       const member = interaction.guild.members.cache.get(userId);
-
-      // Fetch registered role and existing player data
-      const registeredRoleId = (await getQuery('settings', { key: 'registered_role', guild_id: interaction.guildId }))?.value;
-      const existingPlayer = await getQuery('players', { user_id: userId, guild_id: interaction.guildId });
-
-      // Check if user is already fully registered (in DB and has the role)
-      if (existingPlayer && registeredRoleId && member.roles.cache.has(registeredRoleId)) {
-        const embed = new EmbedBuilder()
-          .setTitle('Player Already Registered')
-          .setDescription(`<@${userId}> is already registered as "${existingPlayer.name}" with all roles assigned!`)
-          .setColor('#ffff00');
-        return interaction.reply({ embeds: [embed] });
-      }
-
-      // If not in DB, insert new player data
-      if (!existingPlayer) {
-        try {
-          await runQuery('players', 'INSERT', null, {
-            user_id: userId,
-            name: playerName,
-            elo: 0,
-            wins: 0,
-            losses: 0,
-            mvps: 0,
-            guild_id: interaction.guildId
-          });
-        } catch (error) {
-          if (error.code === 11000) {
-            // Duplicate key error (race condition), proceed to role assignment
-            console.log(`Duplicate key ignored for user ${userId} during force_register`);
-          } else {
-            console.error(`Error inserting player ${userId}:`, error);
-            return interaction.reply('An error occurred while registering the player!');
+    
+      try {
+        // Fetch registered role and existing player data
+        const registeredRoleId = (await getQuery('settings', { key: 'registered_role', guild_id: interaction.guildId }))?.value;
+        const existingPlayer = await getQuery('players', { user_id: userId, guild_id: interaction.guildId });
+    
+        // Check if user is already fully registered (in DB and has the role)
+        if (existingPlayer && registeredRoleId && member.roles.cache.has(registeredRoleId)) {
+          const embed = new EmbedBuilder()
+            .setTitle('Player Already Registered')
+            .setDescription(`<@${userId}> is already registered as "${existingPlayer.name}" with all roles assigned!`)
+            .setColor('#ffff00');
+          return await interaction.reply({ embeds: [embed], ephemeral: true });
+        }
+    
+        // If not in DB, insert new player data
+        if (!existingPlayer) {
+          try {
+            await runQuery('players', 'INSERT', null, {
+              user_id: userId,
+              name: playerName,
+              elo: 0,
+              wins: 0,
+              losses: 0,
+              mvps: 0,
+              guild_id: interaction.guildId
+            });
+          } catch (error) {
+            if (error.code === 11000) {
+              console.log(`Duplicate key ignored for user ${userId} during force_register`);
+            } else {
+              console.error(`Error inserting player ${userId}:`, error);
+              return await interaction.reply({ content: 'An error occurred while registering the player in the database!', ephemeral: true });
+            }
           }
         }
+    
+        // Assign roles if missing
+        const elo = existingPlayer ? existingPlayer.elo : 0;
+        let rolesAssigned = false;
+    
+        if (registeredRoleId && !member.roles.cache.has(registeredRoleId)) {
+          await member.roles.add(registeredRoleId).catch(err => {
+            console.error(`Failed to add registered role to ${userId}:`, err);
+          });
+          rolesAssigned = true;
+        }
+    
+        await assignRankedRole(db, interaction.guild, userId, elo).catch(err => {
+          console.error(`Failed to assign rank role to ${userId}:`, err);
+        });
+        const rankAssigned = (await getQuery('ranks', { start_elo: { $lte: elo }, guild_id: interaction.guildId }, { sort: { start_elo: -1 } }))?.role_id;
+        if (rankAssigned && !member.roles.cache.has(rankAssigned)) {
+          rolesAssigned = true; // Rank role was assigned by assignRankedRole
+        }
+    
+        // Update nickname
+        const finalName = existingPlayer ? existingPlayer.name : playerName;
+        await member.setNickname(`${elo} | ${finalName}`).catch(err => {
+          console.error(`Failed to set nickname for ${userId}:`, err);
+        });
+    
+        // Reply with appropriate embed
+        const embed = new EmbedBuilder()
+          .setTitle(existingPlayer ? 'Player Registration Updated' : 'Player Force Registered')
+          .setDescription(
+            existingPlayer
+              ? `<@${userId}> is already registered as "${existingPlayer.name}". Roles updated if missing!`
+              : `<@${userId}> has been registered as "${playerName}"!`
+          )
+          .setColor(rolesAssigned || !existingPlayer ? '#00ff00' : '#ffff00');
+        await interaction.reply({ embeds: [embed] });
+      } catch (error) {
+        console.error(`Error in force_register for user ${userId}:`, error);
+        if (!interaction.replied && !interaction.deferred) {
+          await interaction.reply({ content: 'An unexpected error occurred while processing this command!', ephemeral: true }).catch(err => {
+            console.error(`Failed to send error reply for ${userId}:`, err);
+          });
+        }
       }
-
-      // Assign roles if missing
-      const elo = existingPlayer ? existingPlayer.elo : 0;
-      let rolesAssigned = false;
-
-      if (registeredRoleId && !member.roles.cache.has(registeredRoleId)) {
-        await member.roles.add(registeredRoleId).catch(console.error);
-        rolesAssigned = true;
-      }
-
-      await assignRankedRole(db, interaction.guild, userId, elo);
-      const rankAssigned = (await getQuery('ranks', { start_elo: { $lte: elo }, guild_id: interaction.guildId }, { sort: { start_elo: -1 } }))?.role_id;
-      if (rankAssigned && !member.roles.cache.has(rankAssigned)) {
-        rolesAssigned = true; // Rank role was assigned by assignRankedRole
-      }
-
-      // Update nickname
-      const finalName = existingPlayer ? existingPlayer.name : playerName;
-      await member.setNickname(`${elo} | ${finalName}`).catch(console.error);
-
-      // Reply with appropriate embed
-      const embed = new EmbedBuilder()
-        .setTitle(existingPlayer ? 'Player Registration Updated' : 'Player Force Registered')
-        .setDescription(
-          existingPlayer
-            ? `<@${userId}> is already registered as "${existingPlayer.name}". Roles updated if missing!`
-            : `<@${userId}> has been registered as "${playerName}"!`
-        )
-        .setColor(rolesAssigned || !existingPlayer ? '#00ff00' : '#ffff00');
-      interaction.reply({ embeds: [embed] });
     }
 
     if (commandName === 'force_rename') {
