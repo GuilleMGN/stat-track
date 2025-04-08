@@ -909,10 +909,9 @@ client.on('interactionCreate', async interaction => {
           const row = new ActionRowBuilder()
             .addComponents(
               new ButtonBuilder().setCustomId(`approve_${userId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
-              new ButtonBuilder().setCustomId(`decline_${userId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
-              new ButtonBuilder().setCustomId(`help_${userId}`).setLabel('Help').setStyle(ButtonStyle.Secondary)
+              new ButtonBuilder().setCustomId(`decline_${userId}`).setLabel('Decline').setStyle(ButtonStyle.Danger)
             );
-          await interaction.reply({ embeds: [embed], components: [row] });
+          await interaction.reply({ embeds: [embed], components: [row], flags: [4096] });
           return;
         }
 
@@ -926,10 +925,9 @@ client.on('interactionCreate', async interaction => {
           const row = new ActionRowBuilder()
             .addComponents(
               new ButtonBuilder().setCustomId(`approve_${userId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
-              new ButtonBuilder().setCustomId(`decline_${userId}`).setLabel('Decline').setStyle(ButtonStyle.Danger),
-              new ButtonBuilder().setCustomId(`help_${userId}`).setLabel('Help').setStyle(ButtonStyle.Secondary)
+              new ButtonBuilder().setCustomId(`decline_${userId}`).setLabel('Decline').setStyle(ButtonStyle.Danger)
             );
-          await interaction.reply({ embeds: [embed], components: [row] });
+          await interaction.reply({ embeds: [embed], components: [row], flags: [4096] });
         }
       });
     }
@@ -1142,7 +1140,7 @@ client.on('interactionCreate', async interaction => {
           new ButtonBuilder().setCustomId('reset_season_no').setLabel('No').setStyle(ButtonStyle.Secondary)
         );
 
-      await interaction.reply({ embeds: [embed], components: [row] });
+      await interaction.reply({ embeds: [embed], components: [row], flags: [4096] });
     }
 
     if (commandName === 'set_results_channel') {
@@ -1160,13 +1158,10 @@ client.on('interactionCreate', async interaction => {
     const { customId, user, guildId, channelId } = interaction;
     const db = await getDb(guildId);
 
-    if (customId.startsWith('approve_') || customId.startsWith('decline_') || customId.startsWith('help_')) {
+    if (customId.startsWith('approve_') || customId.startsWith('decline_')) {
       const [action, userId] = customId.split('_');
       if (!isMod && (action === 'approve' || action === 'decline')) {
         return interaction.reply({ content: 'Only moderators can approve/decline registrations!', flags: [4096] });
-      }
-      if (!isMod && action === 'help') {
-        return interaction.reply('Please include a screenshot of your common statistics (with hours)');
       }
 
       const embed = interaction.message.embeds[0];
@@ -1219,8 +1214,6 @@ client.on('interactionCreate', async interaction => {
           .setColor('#ff0000')
           .setFooter({ text: embed.footer?.text });
         await interaction.update({ embeds: [updatedEmbed], components: [] });
-      } else if (action === 'help') {
-        await interaction.reply('Please include a screenshot of your common statistics (with hours)');
       }
     }
 
