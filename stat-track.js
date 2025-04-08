@@ -977,8 +977,18 @@ client.on('interactionCreate', async interaction => {
     
       const msgId = (await getQuery('settings', { key: `queue_message_${channel.id}`, guild_id: interaction.guildId }))?.value;
       if (msgId) {
-        const queueMsg = await channel.messages.fetch(msgId).catch(() => null);
-        if (queueMsg) await queueMsg.delete();
+        try {
+          const queueMsg = await channel.messages.fetch(msgId).catch(() => null);
+          if (queueMsg) await queueMsg.delete().catch(err => {
+            if (err.code === 10008) {
+              console.log(`Queue message ${msgId} already deleted or inaccessible in channel ${channel.id}`);
+            } else {
+              console.error(`Error deleting queue message ${msgId}:`, err);
+            }
+          });
+        } catch (error) {
+          console.error(`Error fetching queue message ${msgId}:`, error);
+        }
       }
     
       await runQuery('queues', 'DELETE', { channel_id: channel.id, guild_id: interaction.guildId });
