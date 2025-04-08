@@ -464,7 +464,7 @@ client.on('interactionCreate', async interaction => {
     const { commandName, options } = interaction;
 
     if (commandName === 'force_register') {
-      if (!isMod) return interaction.reply('Only moderators can use this command!'); // Fixed typo here
+      if (!isMod) return interaction.reply('Only moderators can use this command!'); 
       const targetUser = options.getUser('user');
       const playerName = options.getString('player_name');
       const userId = targetUser.id;

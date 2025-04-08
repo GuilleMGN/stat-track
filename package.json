@@ -1,9 +1,9 @@
 {
   "name": "stat-track",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "stat-track.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "node stat-track.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "repository": {
@@ -20,8 +20,6 @@
   "description": "",
   "dependencies": {
     "discord.js": "^14.18.0",
-    "mongodb": "^6.15.0",
-    "mongoose": "^8.13.2",
-    "sqlite3": "^5.1.7"
+    "mongodb": "^6.15.0"
   }
 }
