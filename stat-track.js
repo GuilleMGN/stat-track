@@ -63,9 +63,12 @@ const getQuery = async (collectionName, query) => {
 };
 
 // Helper function to mimic db.all
-const allQuery = async (collectionName, query) => {
+const allQuery = async (collectionName, query, options = {}) => {
   const collection = db.collection(collectionName);
-  return await collection.find(query).toArray();
+  let cursor = collection.find(query);
+  if (options.sort) cursor = cursor.sort(options.sort);
+  if (options.limit) cursor = cursor.limit(options.limit);
+  return await cursor.toArray();
 };
 
 // Assign ranked role 
@@ -302,30 +305,72 @@ client.on('interactionCreate', async interaction => {
       const targetUser = options.getUser('user');
       const playerName = options.getString('player_name');
       const userId = targetUser.id;
-
-      const existingPlayer = await getQuery('players', { user_id: userId, guild_id: interaction.guildId });
-      if (existingPlayer) return interaction.reply('This user is already registered!');
-
-      await runQuery('players', 'INSERT', null, {
-        user_id: userId,
-        name: playerName,
-        elo: 0,
-        wins: 0,
-        losses: 0,
-        mvps: 0,
-        guild_id: interaction.guildId
-      });
-
-      const registeredRoleId = (await getQuery('settings', { key: 'registered_role', guild_id: interaction.guildId }))?.value;
       const member = interaction.guild.members.cache.get(userId);
-      if (registeredRoleId) member.roles.add(registeredRoleId).catch(console.error);
-      await assignRankedRole(db, interaction.guild, userId, 0);
-      member.setNickname(`0 | ${playerName}`).catch(console.error);
 
+      // Fetch registered role and existing player data
+      const registeredRoleId = (await getQuery('settings', { key: 'registered_role', guild_id: interaction.guildId }))?.value;
+      const existingPlayer = await getQuery('players', { user_id: userId, guild_id: interaction.guildId });
+
+      // Check if user is already fully registered (in DB and has the role)
+      if (existingPlayer && registeredRoleId && member.roles.cache.has(registeredRoleId)) {
+        const embed = new EmbedBuilder()
+          .setTitle('Player Already Registered')
+          .setDescription(`<@${userId}> is already registered as "${existingPlayer.name}" with all roles assigned!`)
+          .setColor('#ffff00');
+        return interaction.reply({ embeds: [embed] });
+      }
+
+      // If not in DB, insert new player data
+      if (!existingPlayer) {
+        try {
+          await runQuery('players', 'INSERT', null, {
+            user_id: userId,
+            name: playerName,
+            elo: 0,
+            wins: 0,
+            losses: 0,
+            mvps: 0,
+            guild_id: interaction.guildId
+          });
+        } catch (error) {
+          if (error.code === 11000) {
+            // Duplicate key error (race condition), proceed to role assignment
+            console.log(`Duplicate key ignored for user ${userId} during force_register`);
+          } else {
+            console.error(`Error inserting player ${userId}:`, error);
+            return interaction.reply('An error occurred while registering the player!');
+          }
+        }
+      }
+
+      // Assign roles if missing
+      const elo = existingPlayer ? existingPlayer.elo : 0;
+      let rolesAssigned = false;
+
+      if (registeredRoleId && !member.roles.cache.has(registeredRoleId)) {
+        await member.roles.add(registeredRoleId).catch(console.error);
+        rolesAssigned = true;
+      }
+
+      await assignRankedRole(db, interaction.guild, userId, elo);
+      const rankAssigned = (await getQuery('ranks', { start_elo: { $lte: elo }, guild_id: interaction.guildId }, { sort: { start_elo: -1 } }))?.role_id;
+      if (rankAssigned && !member.roles.cache.has(rankAssigned)) {
+        rolesAssigned = true; // Rank role was assigned by assignRankedRole
+      }
+
+      // Update nickname
+      const finalName = existingPlayer ? existingPlayer.name : playerName;
+      await member.setNickname(`${elo} | ${finalName}`).catch(console.error);
+
+      // Reply with appropriate embed
       const embed = new EmbedBuilder()
-        .setTitle('Player Force Registered')
-        .setDescription(`<@${userId}> has been registered as "${playerName}"!`)
-        .setColor('#00ff00');
+        .setTitle(existingPlayer ? 'Player Registration Updated' : 'Player Force Registered')
+        .setDescription(
+          existingPlayer
+            ? `<@${userId}> is already registered as "${existingPlayer.name}". Roles updated if missing!`
+            : `<@${userId}> has been registered as "${playerName}"!`
+        )
+        .setColor(rolesAssigned || !existingPlayer ? '#00ff00' : '#ffff00');
       interaction.reply({ embeds: [embed] });
     }
 
@@ -588,17 +633,70 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (commandName === 'leaderboard') {
-      const players = await allQuery('players', { guild_id: interaction.guildId }, { sort: { elo: -1 }, limit: 10 });
-      const leaderboard = players.length > 0
-        ? players.map((row, index) => `${index + 1}. ${row.elo} | ${row.name}`).join('\n')
-        : 'No players registered yet.';
-      const embed = new EmbedBuilder()
-        .setTitle('Leaderboard - Top 10 Players')
-        .setDescription(leaderboard)
-        .setColor('#FFD700')
-        .setFooter({ text: `Total Players: ${players.length}` })
-        .setTimestamp();
-      interaction.reply({ embeds: [embed] });
+      const players = await allQuery('players', { guild_id: interaction.guildId }, { sort: { elo: -1 } });
+      const pageSize = 10;
+      let page = 0;
+
+      const getLeaderboardEmbed = (players, page) => {
+        const start = page * pageSize;
+        const end = start + pageSize;
+        const pagePlayers = players.slice(start, end);
+        const leaderboard = pagePlayers.length > 0
+          ? pagePlayers.map((row, index) => `${start + index + 1}. ${row.elo} | ${row.name}`).join('\n')
+          : 'No players on this page.';
+        return new EmbedBuilder()
+          .setTitle('Leaderboard - Top Players')
+          .setDescription(leaderboard)
+          .setColor('#FFD700')
+          .setFooter({ text: `Page ${page + 1} of ${Math.ceil(players.length / pageSize)} | Total Players: ${players.length}` })
+          .setTimestamp();
+      };
+
+      const getButtons = (page, totalPages) => {
+        return new ActionRowBuilder()
+          .addComponents(
+            new ButtonBuilder()
+              .setCustomId('prev_leaderboard')
+              .setLabel('Prev')
+              .setStyle(ButtonStyle.Primary)
+              .setDisabled(page === 0),
+            new ButtonBuilder()
+              .setCustomId('next_leaderboard')
+              .setLabel('Next')
+              .setStyle(ButtonStyle.Primary)
+              .setDisabled(page === totalPages - 1 || players.length === 0)
+          );
+      };
+
+      const totalPages = Math.ceil(players.length / pageSize);
+      const initialEmbed = getLeaderboardEmbed(players, page);
+      const initialButtons = getButtons(page, totalPages);
+
+      const message = await interaction.reply({ embeds: [initialEmbed], components: [initialButtons], fetchReply: true });
+
+      const collector = message.createMessageComponentCollector({ time: 60000 }); // 1 minute timeout
+      collector.on('collect', async i => {
+        if (i.customId === 'prev_leaderboard' && page > 0) {
+          page--;
+        } else if (i.customId === 'next_leaderboard' && page < totalPages - 1) {
+          page++;
+        } else {
+          return;
+        }
+
+        const updatedEmbed = getLeaderboardEmbed(players, page);
+        const updatedButtons = getButtons(page, totalPages);
+        await i.update({ embeds: [updatedEmbed], components: [updatedButtons] });
+      });
+
+      collector.on('end', () => {
+        const disabledButtons = new ActionRowBuilder()
+          .addComponents(
+            new ButtonBuilder().setCustomId('prev_leaderboard').setLabel('Prev').setStyle(ButtonStyle.Primary).setDisabled(true),
+            new ButtonBuilder().setCustomId('next_leaderboard').setLabel('Next').setStyle(ButtonStyle.Primary).setDisabled(true)
+          );
+        message.edit({ components: [disabledButtons] }).catch(() => { }); // Ignore if message deleted
+      });
     }
 
     if (commandName === 'add_rank') {
@@ -609,24 +707,41 @@ client.on('interactionCreate', async interaction => {
       const lossElo = options.getInteger('loss');
       const mvpElo = options.getInteger('mvp');
 
-      await runQuery('ranks', 'INSERT', null, {
-        role_id: role.id,
-        start_elo: startElo,
-        win_elo: winElo,
-        loss_elo: lossElo,
-        mvp_elo: mvpElo,
-        guild_id: interaction.guildId
-      });
-
-      const embed = new EmbedBuilder()
-        .setTitle('Rank Added')
-        .setDescription(`Rank <@&${role.id}> added with Start: ${startElo}, Win: +${winElo}, Loss: -${lossElo}, MVP: +${mvpElo}`)
-        .setColor('#00ff00');
-      interaction.reply({ embeds: [embed] });
+      // Check if a rank with the same start_elo and guild_id already exists
+      const existingRank = await getQuery('ranks', { start_elo: startElo, guild_id: interaction.guildId });
+      if (existingRank) {
+        // Update the existing rank
+        await runQuery('ranks', 'UPDATE', { start_elo: startElo, guild_id: interaction.guildId }, {
+          role_id: role.id,
+          win_elo: winElo,
+          loss_elo: lossElo,
+          mvp_elo: mvpElo
+        });
+        const embed = new EmbedBuilder()
+          .setTitle('Rank Updated')
+          .setDescription(`Rank with starting Elo ${startElo} updated to <@&${role.id}> with Win: +${winElo}, Loss: -${lossElo}, MVP: +${mvpElo}`)
+          .setColor('#00ff00');
+        interaction.reply({ embeds: [embed] });
+      } else {
+        // Insert a new rank
+        await runQuery('ranks', 'INSERT', null, {
+          role_id: role.id,
+          start_elo: startElo,
+          win_elo: winElo,
+          loss_elo: lossElo,
+          mvp_elo: mvpElo,
+          guild_id: interaction.guildId
+        });
+        const embed = new EmbedBuilder()
+          .setTitle('Rank Added')
+          .setDescription(`Rank <@&${role.id}> added with Start: ${startElo}, Win: +${winElo}, Loss: -${lossElo}, MVP: +${mvpElo}`)
+          .setColor('#00ff00');
+        interaction.reply({ embeds: [embed] });
+      }
     }
 
     if (commandName === 'ranks') {
-      const ranks = await allQuery('ranks', { guild_id: interaction.guildId }, { sort: { start_elo: 1 } });
+      const ranks = await allQuery('ranks', { guild_id: interaction.guildId }, { sort: { start_elo: -1 } });
       const rankList = ranks.length > 0
         ? ranks.map(row => `<@&${row.role_id}> ST: ${row.start_elo} W:(+${row.win_elo}) L:(-${row.loss_elo}) MVP:(+${row.mvp_elo})`).join('\n')
         : 'No ranks defined.';
@@ -766,7 +881,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (commandName === 'maps') {
-      const maps = await allQuery('maps', { guild_id: interaction.guildId });
+      const maps = await allQuery('maps', { guild_id: interaction.guildId }, { sort: { _id: 1 } });
       const mapList = maps.map(row => row.map_name).join('\n') || 'No maps found.';
       const embed = new EmbedBuilder()
         .setTitle('Map List')
@@ -835,7 +950,7 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (commandName === 'queues') {
-      const queues = await allQuery('queues', { guild_id: interaction.guildId });
+      const queues = await allQuery('queues', { guild_id: interaction.guildId }, { sort: { _id: 1 } });
       const queueList = await Promise.all(queues.map(async row => {
         const bonus = parseInt((await getQuery('settings', { key: `queue_bonus_${row.channel_id}`, guild_id: interaction.guildId }))?.value || 0);
         return (
