@@ -915,53 +915,76 @@ client.on('interactionCreate', async interaction => {
       const role = options.getRole('role');
       const title = options.getString('title') || 'Matchmaking Queue';
       const bonus = options.getInteger('bonus') || 0;
-
+    
       if (channel.type !== 0) return interaction.reply('The channel_id must be a text channel!');
       if (voiceChannel.type !== 2) return interaction.reply('The voice_channel_id must be a voice channel!');
-
+    
       try {
-        await runQuery('queues', 'INSERT', null, {
-          channel_id: channel.id,
-          guild_id: interaction.guildId,
-          title,
-          voice_channel_id: voiceChannel.id,
-          role_id: role.id
-        });
-
+        // Insert or update queue entry
+        const existingQueue = await getQuery('queues', { channel_id: channel.id, guild_id: interaction.guildId });
+        if (!existingQueue) {
+          await runQuery('queues', 'INSERT', null, {
+            channel_id: channel.id,
+            guild_id: interaction.guildId,
+            title,
+            voice_channel_id: voiceChannel.id,
+            role_id: role.id
+          });
+        } else {
+          await runQuery('queues', 'UPDATE', { channel_id: channel.id, guild_id: interaction.guildId }, {
+            title,
+            voice_channel_id: voiceChannel.id,
+            role_id: role.id
+          });
+        }
+    
         const embed = new EmbedBuilder()
           .setTitle(title)
           .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
           .setColor('#0099ff')
           .setFooter({ text: 'Queue initialized' })
           .setTimestamp();
-
+    
         const msg = await channel.send({ embeds: [embed] });
-        await runQuery('settings', 'INSERT', null, { key: `queue_message_${channel.id}`, value: msg.id, guild_id: interaction.guildId });
-        await runQuery('settings', 'INSERT', null, { key: `queue_bonus_${channel.id}`, value: bonus.toString(), guild_id: interaction.guildId });
-
+    
+        // Insert or update settings
+        await runQuery('settings', 'INSERT', null, { key: `queue_message_${channel.id}`, value: msg.id, guild_id: interaction.guildId })
+          .catch(async (error) => {
+            if (error.code === 11000) {
+              await runQuery('settings', 'UPDATE', { key: `queue_message_${channel.id}`, guild_id: interaction.guildId }, { value: msg.id });
+            } else throw error;
+          });
+        await runQuery('settings', 'INSERT', null, { key: `queue_bonus_${channel.id}`, value: bonus.toString(), guild_id: interaction.guildId })
+          .catch(async (error) => {
+            if (error.code === 11000) {
+              await runQuery('settings', 'UPDATE', { key: `queue_bonus_${channel.id}`, guild_id: interaction.guildId }, { value: bonus.toString() });
+            } else throw error;
+          });
+    
         interaction.reply(`Queue channel set to <#${channel.id}> with voice channel <#${voiceChannel.id}> and role <@&${role.id}>!`);
       } catch (error) {
-        interaction.reply('Error adding queue channel!');
         console.error('Add queue error:', error);
+        interaction.reply('Error adding queue channel!');
       }
     }
 
     if (commandName === 'remove_queue') {
       if (!isMod) return interaction.reply('Only moderators can use this command!');
       const channel = options.getChannel('channel_id');
-
+    
       const queue = await getQuery('queues', { channel_id: channel.id, guild_id: interaction.guildId });
       if (!queue) return interaction.reply(`<#${channel.id}> is not a queue channel!`);
-
+    
       const msgId = (await getQuery('settings', { key: `queue_message_${channel.id}`, guild_id: interaction.guildId }))?.value;
       if (msgId) {
         const queueMsg = await channel.messages.fetch(msgId).catch(() => null);
         if (queueMsg) await queueMsg.delete();
       }
-
+    
       await runQuery('queues', 'DELETE', { channel_id: channel.id, guild_id: interaction.guildId });
       await runQuery('settings', 'DELETE', { key: `queue_message_${channel.id}`, guild_id: interaction.guildId });
-
+      await runQuery('settings', 'DELETE', { key: `queue_bonus_${channel.id}`, guild_id: interaction.guildId });
+    
       interaction.reply(`Queue channel <#${channel.id}> removed!`);
     }
 
