@@ -308,12 +308,12 @@ client.on('interactionCreate', async interaction => {
       const playerName = options.getString('player_name');
       const userId = targetUser.id;
       const member = interaction.guild.members.cache.get(userId);
-    
+
       try {
         // Fetch registered role and existing player data
         const registeredRoleId = (await getQuery('settings', { key: 'registered_role', guild_id: interaction.guildId }))?.value;
         const existingPlayer = await getQuery('players', { user_id: userId, guild_id: interaction.guildId });
-    
+
         // Check if user is already fully registered (in DB and has the role)
         if (existingPlayer && registeredRoleId && member.roles.cache.has(registeredRoleId)) {
           const embed = new EmbedBuilder()
@@ -322,7 +322,7 @@ client.on('interactionCreate', async interaction => {
             .setColor('#ffff00');
           return await interaction.reply({ embeds: [embed], ephemeral: true });
         }
-    
+
         // If not in DB, insert new player data
         if (!existingPlayer) {
           try {
@@ -344,18 +344,18 @@ client.on('interactionCreate', async interaction => {
             }
           }
         }
-    
+
         // Assign roles if missing
         const elo = existingPlayer ? existingPlayer.elo : 0;
         let rolesAssigned = false;
-    
+
         if (registeredRoleId && !member.roles.cache.has(registeredRoleId)) {
           await member.roles.add(registeredRoleId).catch(err => {
             console.error(`Failed to add registered role to ${userId}:`, err);
           });
           rolesAssigned = true;
         }
-    
+
         await assignRankedRole(db, interaction.guild, userId, elo).catch(err => {
           console.error(`Failed to assign rank role to ${userId}:`, err);
         });
@@ -363,13 +363,13 @@ client.on('interactionCreate', async interaction => {
         if (rankAssigned && !member.roles.cache.has(rankAssigned)) {
           rolesAssigned = true; // Rank role was assigned by assignRankedRole
         }
-    
+
         // Update nickname
         const finalName = existingPlayer ? existingPlayer.name : playerName;
         await member.setNickname(`${elo} | ${finalName}`).catch(err => {
           console.error(`Failed to set nickname for ${userId}:`, err);
         });
-    
+
         // Reply with appropriate embed
         const embed = new EmbedBuilder()
           .setTitle(existingPlayer ? 'Player Registration Updated' : 'Player Force Registered')
@@ -797,40 +797,66 @@ client.on('interactionCreate', async interaction => {
       const member = interaction.member;
 
       const registeredRoleId = (await getQuery('settings', { key: 'registered_role', guild_id: interaction.guildId }))?.value;
-      const hasRegisteredRole = registeredRoleId && member.roles.cache.has(registeredRoleId);
-      const dbRow = await getQuery('players', { user_id: userId, guild_id: interaction.guildId });
+      const existingPlayer = await getQuery('players', { user_id: userId, guild_id: interaction.guildId });
 
-      if (hasRegisteredRole && dbRow) {
-        return interaction.reply('You are already registered!');
+      // If user is already registered, notify and exit
+      if (existingPlayer) {
+        const embed = new EmbedBuilder()
+          .setTitle('Registration Failed')
+          .setDescription(`<@${userId}> is already registered as "${existingPlayer.name}"! Use /rename to change your name.`)
+          .setColor('#ff0000');
+        return interaction.reply({ embeds: [embed] });
       }
 
-      if (dbRow && !hasRegisteredRole) {
-        const embed = new EmbedBuilder()
-          .setTitle('Registration Request')
-          .setDescription(`<@${userId}> registration awaiting approval...`)
-          .setColor('#ffff00')
-          .setFooter({ text: `Requested Name: ${playerName} | Re-registration` });
-        const row = new ActionRowBuilder()
-          .addComponents(
-            new ButtonBuilder().setCustomId(`approve_${userId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`decline_${userId}`).setLabel('Decline').setStyle(ButtonStyle.Danger)
-          );
-        await interaction.reply({ embeds: [embed], components: [row], flags: [4096] });
-        return;
-      }
+      // Register the new player
+      try {
+        await runQuery('players', 'INSERT', null, {
+          user_id: userId,
+          name: playerName,
+          elo: 0,
+          wins: 0,
+          losses: 0,
+          mvps: 0,
+          guild_id: interaction.guildId
+        });
 
-      if (!dbRow) {
+        // Assign roles
+        if (registeredRoleId) {
+          await member.roles.add(registeredRoleId).catch(err => {
+            console.error(`Failed to add registered role to ${userId}:`, err);
+          });
+        }
+        await assignRankedRole(db, interaction.guild, userId, 0).catch(err => {
+          console.error(`Failed to assign rank role to ${userId}:`, err);
+        });
+
+        // Set nickname
+        await member.setNickname(`0 | ${playerName}`).catch(err => {
+          console.error(`Failed to set nickname for ${userId}:`, err);
+        });
+
+        // Send success embed to channel (non-ephemeral)
         const embed = new EmbedBuilder()
-          .setTitle('Registration Request')
-          .setDescription(`<@${userId}> registration awaiting approval...`)
-          .setColor('#ffff00')
-          .setFooter({ text: `Requested Name: ${playerName}` });
-        const row = new ActionRowBuilder()
-          .addComponents(
-            new ButtonBuilder().setCustomId(`approve_${userId}`).setLabel('Approve').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`decline_${userId}`).setLabel('Decline').setStyle(ButtonStyle.Danger)
-          );
-        await interaction.reply({ embeds: [embed], components: [row], flags: [4096] });
+          .setTitle('Player Registered')
+          .setDescription(`<@${userId}> has successfully registered as "${playerName}"!`)
+          .setColor('#00ff00')
+          .setTimestamp();
+        await interaction.reply({ embeds: [embed] });
+      } catch (error) {
+        console.error(`Error registering user ${userId}:`, error);
+        if (error.code === 11000) {
+          const embed = new EmbedBuilder()
+            .setTitle('Registration Failed')
+            .setDescription(`<@${userId}> is already registered! Use /rename to change your name.`)
+            .setColor('#ff0000');
+          await interaction.reply({ embeds: [embed] });
+        } else {
+          const embed = new EmbedBuilder()
+            .setTitle('Registration Error')
+            .setDescription(`An error occurred while registering <@${userId}>. Please try again later.`)
+            .setColor('#ff0000');
+          await interaction.reply({ embeds: [embed] });
+        }
       }
     }
 
@@ -915,10 +941,10 @@ client.on('interactionCreate', async interaction => {
       const role = options.getRole('role');
       const title = options.getString('title') || 'Matchmaking Queue';
       const bonus = options.getInteger('bonus') || 0;
-    
+
       if (channel.type !== 0) return interaction.reply('The channel_id must be a text channel!');
       if (voiceChannel.type !== 2) return interaction.reply('The voice_channel_id must be a voice channel!');
-    
+
       try {
         // Insert or update queue entry
         const existingQueue = await getQuery('queues', { channel_id: channel.id, guild_id: interaction.guildId });
@@ -937,16 +963,16 @@ client.on('interactionCreate', async interaction => {
             role_id: role.id
           });
         }
-    
+
         const embed = new EmbedBuilder()
           .setTitle(title)
           .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
           .setColor('#0099ff')
           .setFooter({ text: 'Queue initialized' })
           .setTimestamp();
-    
+
         const msg = await channel.send({ embeds: [embed] });
-    
+
         // Insert or update settings
         await runQuery('settings', 'INSERT', null, { key: `queue_message_${channel.id}`, value: msg.id, guild_id: interaction.guildId })
           .catch(async (error) => {
@@ -960,7 +986,7 @@ client.on('interactionCreate', async interaction => {
               await runQuery('settings', 'UPDATE', { key: `queue_bonus_${channel.id}`, guild_id: interaction.guildId }, { value: bonus.toString() });
             } else throw error;
           });
-    
+
         interaction.reply(`Queue channel set to <#${channel.id}> with voice channel <#${voiceChannel.id}> and role <@&${role.id}>!`);
       } catch (error) {
         console.error('Add queue error:', error);
@@ -971,10 +997,10 @@ client.on('interactionCreate', async interaction => {
     if (commandName === 'remove_queue') {
       if (!isMod) return interaction.reply('Only moderators can use this command!');
       const channel = options.getChannel('channel_id');
-    
+
       const queue = await getQuery('queues', { channel_id: channel.id, guild_id: interaction.guildId });
       if (!queue) return interaction.reply(`<#${channel.id}> is not a queue channel!`);
-    
+
       const msgId = (await getQuery('settings', { key: `queue_message_${channel.id}`, guild_id: interaction.guildId }))?.value;
       if (msgId) {
         try {
@@ -990,11 +1016,11 @@ client.on('interactionCreate', async interaction => {
           console.error(`Error fetching queue message ${msgId}:`, error);
         }
       }
-    
+
       await runQuery('queues', 'DELETE', { channel_id: channel.id, guild_id: interaction.guildId });
       await runQuery('settings', 'DELETE', { key: `queue_message_${channel.id}`, guild_id: interaction.guildId });
       await runQuery('settings', 'DELETE', { key: `queue_bonus_${channel.id}`, guild_id: interaction.guildId });
-    
+
       interaction.reply(`Queue channel <#${channel.id}> removed!`);
     }
 
