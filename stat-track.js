@@ -242,6 +242,13 @@ const commands = [
   new SlashCommandBuilder().setName('set_updates_channel').setDescription('Set the rank updates channel (Mods only)')
     .addChannelOption(option => option.setName('channel_id').setDescription('The channel for rank updates').setRequired(true)),
   new SlashCommandBuilder().setName('reset_season').setDescription('Reset all match and player statistics (Mods only)'),
+  new SlashCommandBuilder().setName('custom_embed').setDescription('Create a custom embed message (Mods only)')
+    .addStringOption(option => option.setName('title').setDescription('The title of the embed').setRequired(true))
+    .addStringOption(option => option.setName('message').setDescription('The message body of the embed').setRequired(true))
+    .addStringOption(option => option.setName('color').setDescription('The color of the embed (e.g., Red, Orange, Black, White, default: Blue)').setRequired(false)),
+  new SlashCommandBuilder().setName('custom_message').setDescription('Send a custom text message (Mods only)')
+    .addStringOption(option => option.setName('text').setDescription('The text to send').setRequired(true))
+    .addChannelOption(option => option.setName('channel').setDescription('The channel to send the message to (default: current channel)').setRequired(false)),
 ].map(command => command.toJSON());
 
 // Bot startup
@@ -690,7 +697,26 @@ client.on('interactionCreate', async interaction => {
 
       const message = await interaction.reply({ embeds: [initialEmbed], components: [initialButtons], fetchReply: true });
 
-      const collector = message.createMessageComponentCollector({ time: 60000 }); // 1 minute timeout
+      // Store the active leaderboard message for this guild
+      if (!client.activeLeaderboards) client.activeLeaderboards = new Map();
+      const guildId = interaction.guildId;
+      const previousLeaderboard = client.activeLeaderboards.get(guildId);
+
+      // Disable buttons on the previous leaderboard
+      if (previousLeaderboard) {
+        const disabledButtons = new ActionRowBuilder()
+          .addComponents(
+            new ButtonBuilder().setCustomId('prev_leaderboard').setLabel('Prev').setStyle(ButtonStyle.Primary).setDisabled(true),
+            new ButtonBuilder().setCustomId('next_leaderboard').setLabel('Next').setStyle(ButtonStyle.Primary).setDisabled(true)
+          );
+        await previousLeaderboard.edit({ components: [disabledButtons] }).catch(() => { }); // Ignore if message is deleted
+      }
+
+      // Set the new active leaderboard
+      client.activeLeaderboards.set(guildId, message);
+
+      const collector = message.createMessageComponentCollector(); // No time limit
+
       collector.on('collect', async i => {
         if (i.customId === 'prev_leaderboard' && page > 0) {
           page--;
@@ -706,12 +732,15 @@ client.on('interactionCreate', async interaction => {
       });
 
       collector.on('end', () => {
-        const disabledButtons = new ActionRowBuilder()
-          .addComponents(
-            new ButtonBuilder().setCustomId('prev_leaderboard').setLabel('Prev').setStyle(ButtonStyle.Primary).setDisabled(true),
-            new ButtonBuilder().setCustomId('next_leaderboard').setLabel('Next').setStyle(ButtonStyle.Primary).setDisabled(true)
-          );
-        message.edit({ components: [disabledButtons] }).catch(() => { }); // Ignore if message deleted
+        // Only disable if explicitly stopped (not by timeout)
+        if (client.activeLeaderboards.get(guildId) === message) {
+          const disabledButtons = new ActionRowBuilder()
+            .addComponents(
+              new ButtonBuilder().setCustomId('prev_leaderboard').setLabel('Prev').setStyle(ButtonStyle.Primary).setDisabled(true),
+              new ButtonBuilder().setCustomId('next_leaderboard').setLabel('Next').setStyle(ButtonStyle.Primary).setDisabled(true)
+            );
+          message.edit({ components: [disabledButtons] }).catch(() => { }); // Ignore if message deleted
+        }
       });
     }
 
@@ -1061,6 +1090,94 @@ client.on('interactionCreate', async interaction => {
         );
 
       await interaction.reply({ embeds: [embed], components: [row], flags: [4096] });
+    }
+
+    if (commandName === 'custom_embed') {
+      if (!isMod) {
+        return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      }
+
+      const title = options.getString('title').trim();
+      const message = options.getString('message').trim();
+      const colorInput = options.getString('color')?.trim() || 'Blue'; // Default to Blue
+
+      // Check for blank inputs
+      if (!title) {
+        return interaction.reply({ content: 'The title cannot be blank!', ephemeral: true });
+      }
+      if (!message) {
+        return interaction.reply({ content: 'The message cannot be blank!', ephemeral: true });
+      }
+
+      // Predefined color mapping (case-insensitive)
+      const colorMap = {
+        red: 0xFF0000,
+        orange: 0xFFA500,
+        yellow: 0xFFFF00,
+        green: 0x00FF00,
+        blue: 0x0099FF, // Default
+        purple: 0x800080,
+        black: 0x000000,
+        white: 0xFFFFFF,
+        gray: 0x808080,
+        pink: 0xFFC1CC
+      };
+
+      // Normalize color input to lowercase for matching
+      const normalizedColor = colorInput.toLowerCase();
+      const color = colorMap[normalizedColor];
+
+      if (!color && colorInput !== 'Blue') { // Allow default even if mistyped slightly
+        return interaction.reply({
+          content: 'Invalid color! Use one of: Red, Orange, Yellow, Green, Blue, Purple, Black, White, Gray, Pink',
+          ephemeral: true
+        });
+      }
+
+      try {
+        // Create the embed
+        const embed = new EmbedBuilder()
+          .setTitle(title)
+          .setDescription(message)
+          .setColor(color || colorMap.blue) // Fallback to blue if somehow undefined
+          .setTimestamp();
+
+        // Send the embed as a separate message in the same channel
+        await interaction.channel.send({ embeds: [embed] });
+
+        // Reply with ephemeral success message
+        await interaction.reply({ content: 'Embed message created!', ephemeral: true });
+      } catch (error) {
+        console.error(`Error in custom_embed for guild ${interaction.guildId}:`, error);
+        await interaction.reply({ content: 'An error occurred while creating the embed! Please try again.', ephemeral: true });
+      }
+    }
+
+    if (commandName === 'custom_message') {
+      if (!isMod) {
+        return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
+      }
+    
+      const text = options.getString('text').trim();
+      const channel = options.getChannel('channel') || interaction.channel;
+    
+      // Check for blank text
+      if (!text) {
+        return interaction.reply({ content: 'The text cannot be blank!', ephemeral: true });
+      }
+    
+      // Ensure the channel is a text channel
+      if (channel.type !== 0) { // 0 = GuildText
+        return interaction.reply({ content: 'The specified channel must be a text channel!', ephemeral: true });
+      }
+
+      try {
+        // Send the text as a standalone message in the specified channel
+        await channel.send(text);
+      } catch (error) {
+        console.error(`Error in custom_message for guild ${interaction.guildId}:`, error);
+        await interaction.reply({ content: 'An error occurred while sending the message! Check bot permissions or try again.', ephemeral: true });
+      }
     }
 
     if (commandName === 'set_results_channel') {
