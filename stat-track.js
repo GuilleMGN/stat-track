@@ -257,8 +257,15 @@ client.once('ready', async () => {
   await connectToMongoDB(); // Connect to MongoDB on startup
   try {
     await client.application.commands.set(commands);
-    console.log('Slash commands registered! ');
+    console.log('Slash commands registered successfully!');
+  } catch (error) {
+    console.error('Error registering slash commands:', error);
+    // Log a warning but continue to allow queue initialization
+    console.log('Continuing with partial initialization due to command registration failure.');
+  }
+  console.log('Slash command registration process completed.');
 
+  try {
     for (const guild of client.guilds.cache.values()) {
       const db = await getDb();
       const queues = await allQuery('queues', { guild_id: guild.id });
@@ -290,8 +297,9 @@ client.once('ready', async () => {
         }
       }
     }
+    console.log('Queue initialization completed.');
   } catch (error) {
-    console.error('Error registering commands or initializing queues:', error);
+    console.error('Error during queue initialization:', error);
   }
 });
 
