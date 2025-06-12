@@ -257,7 +257,7 @@ client.once('ready', async () => {
   await connectToMongoDB(); // Connect to MongoDB on startup
   try {
     await client.application.commands.set(commands);
-    console.log('Slash commands registered!');
+    console.log('Slash commands registered! ');
 
     for (const guild of client.guilds.cache.values()) {
       const db = await getDb();
