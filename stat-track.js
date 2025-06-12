@@ -826,7 +826,7 @@ client.on('interactionCreate', async interaction => {
     if (commandName === 'register') {
       const registerChannelId = (await getQuery('settings', { key: 'register_channel', guild_id: interaction.guildId }))?.value;
       if (registerChannelId && interaction.channelId !== registerChannelId) {
-        return interaction.reply(`Please use this command in <@${registerChannelId}>!`);
+        return interaction.reply(`Please use this command in <#${registerChannelId}>!`);
       }
 
       const playerName = options.getString('player_name');
@@ -836,63 +836,103 @@ client.on('interactionCreate', async interaction => {
       const registeredRoleId = (await getQuery('settings', { key: 'registered_role', guild_id: interaction.guildId }))?.value;
       const existingPlayer = await getQuery('players', { user_id: userId, guild_id: interaction.guildId });
 
-      // If user is already registered, notify and exit
+      // If user is already registered
       if (existingPlayer) {
-        const embed = new EmbedBuilder()
-          .setTitle('Registration Failed')
-          .setDescription(`<@${userId}> is already registered as "${existingPlayer.name}"! Use /rename to change your name.`)
-          .setColor('#ff0000');
-        return interaction.reply({ embeds: [embed] });
-      }
+        // Check if roles or nickname are missing, indicating a rejoin
+        const hasRegisteredRole = registeredRoleId ? member.roles.cache.has(registeredRoleId) : true;
+        const currentNickname = member.nickname || `${member.user.username}#${member.user.discriminator}`;
+        const expectedNickname = `${existingPlayer.elo} | ${existingPlayer.name}`;
+        const needsRoleUpdate = !hasRegisteredRole || currentNickname !== expectedNickname;
 
-      // Register the new player
-      try {
-        await runQuery('players', 'INSERT', null, {
-          user_id: userId,
-          name: playerName,
-          elo: 0,
-          wins: 0,
-          losses: 0,
-          mvps: 0,
-          guild_id: interaction.guildId
-        });
+        if (needsRoleUpdate) {
+          try {
+            // Reassign registered role if missing
+            if (registeredRoleId && !member.roles.cache.has(registeredRoleId)) {
+              await member.roles.add(registeredRoleId).catch(err => {
+                console.error(`Failed to add registered role to ${userId}:`, err);
+              });
+            }
 
-        // Assign roles
-        if (registeredRoleId) {
-          await member.roles.add(registeredRoleId).catch(err => {
-            console.error(`Failed to add registered role to ${userId}:`, err);
-          });
-        }
-        await assignRankedRole(db, interaction.guild, userId, 0).catch(err => {
-          console.error(`Failed to assign rank role to ${userId}:`, err);
-        });
+            // Reassign rank role based on existing Elo
+            await assignRankedRole(db, interaction.guild, userId, existingPlayer.elo).catch(err => {
+              console.error(`Failed to assign rank role to ${userId}:`, err);
+            });
 
-        // Set nickname
-        await member.setNickname(`0 | ${playerName}`).catch(err => {
-          console.error(`Failed to set nickname for ${userId}:`, err);
-        });
+            // Update nickname to match Elo and name
+            await member.setNickname(expectedNickname).catch(err => {
+              console.error(`Failed to set nickname for ${userId}:`, err);
+            });
 
-        // Send success embed to channel (non-ephemeral)
-        const embed = new EmbedBuilder()
-          .setTitle('Player Registered')
-          .setDescription(`<@${userId}> has successfully registered as "${playerName}"!`)
-          .setColor('#00ff00')
-          .setTimestamp();
-        await interaction.reply({ embeds: [embed] });
-      } catch (error) {
-        console.error(`Error registering user ${userId}:`, error);
-        if (error.code === 11000) {
+            // Send success message for role restoration
+            const embed = new EmbedBuilder()
+              .setTitle('Player Roles Restored')
+              .setDescription(`<@${userId}> was already registered as "${existingPlayer.name}". Roles and nickname have been restored!`)
+              .setColor('#00ff00')
+              .setTimestamp();
+            await interaction.reply({ embeds: [embed] });
+          } catch (error) {
+            console.error(`Error restoring roles for user ${userId}:`, error);
+            const embed = new EmbedBuilder()
+              .setTitle('Registration Error')
+              .setDescription(`An error occurred while restoring roles for <@${userId}>. Please try again or contact a moderator.`)
+              .setColor('#ff0000');
+            await interaction.reply({ embeds: [embed] });
+          }
+        } else {
+          // User is registered and roles/nickname are intact, suggest rename
           const embed = new EmbedBuilder()
             .setTitle('Registration Failed')
-            .setDescription(`<@${userId}> is already registered! Use /rename to change your name.`)
+            .setDescription(`<@${userId}> is already registered as "${existingPlayer.name}"! Use /rename to change your name.`)
             .setColor('#ff0000');
           await interaction.reply({ embeds: [embed] });
-        } else {
+        }
+      } else {
+        // Register new player (original logic)
+        try {
+          await runQuery('players', 'INSERT', null, {
+            user_id: userId,
+            name: playerName,
+            elo: 0,
+            wins: 0,
+            losses: 0,
+            mvps: 0,
+            guild_id: interaction.guildId
+          });
+
+          if (registeredRoleId) {
+            await member.roles.add(registeredRoleId).catch(err => {
+              console.error(`Failed to add registered role to ${userId}:`, err);
+            });
+          }
+          await assignRankedRole(db, interaction.guild, userId, 0).catch(err => {
+            console.error(`Failed to assign rank role to ${userId}:`, err);
+          });
+
+          await member.setNickname(`0 | ${playerName}`).catch(err => {
+            console.error(`Failed to set nickname for ${userId}:`, err);
+          });
+
           const embed = new EmbedBuilder()
-            .setTitle('Registration Error')
-            .setDescription(`An error occurred while registering <@${userId}>. Please try again later.`)
-            .setColor('#ff0000');
+            .setTitle('Player Registered')
+            .setDescription(`<@${userId}> has successfully registered as "${playerName}"!`)
+            .setColor('#00ff00')
+            .setTimestamp();
           await interaction.reply({ embeds: [embed] });
+        } catch (error) {
+          console.error(`Error registering user ${userId}:`, error);
+          if (error.code === 11000) {
+            const embed = new EmbedBuilder()
+              .setTitle('Registration Failed')
+              .setDescription(`<@${userId}> is already registered! Use /rename to change your name.`)
+              .setColor('#ff0000');
+            await interaction.reply({ embeds: [embed] });
+          } else {
+            const embed = new EmbedBuilder()
+              .setTitle('Registration Error')
+              .setDescription(`An error occurred while registering <@${userId}>. Please try again later.`)
+              .setColor('#ff0000');
+            await interaction.reply({ embeds: [embed] });
+          }
         }
       }
     }
@@ -1165,15 +1205,15 @@ client.on('interactionCreate', async interaction => {
       if (!isMod) {
         return interaction.reply({ content: 'Only moderators can use this command!', ephemeral: true });
       }
-    
+
       const text = options.getString('text').trim();
       const channel = options.getChannel('channel') || interaction.channel;
-    
+
       // Check for blank text
       if (!text) {
         return interaction.reply({ content: 'The text cannot be blank!', ephemeral: true });
       }
-    
+
       // Ensure the channel is a text channel
       if (channel.type !== 0) { // 0 = GuildText
         return interaction.reply({ content: 'The specified channel must be a text channel!', ephemeral: true });
