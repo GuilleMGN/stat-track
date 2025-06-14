@@ -1245,14 +1245,14 @@ client.on('interactionCreate', async interaction => {
     if (customId.startsWith('approve_') || customId.startsWith('decline_')) {
       const [action, userId] = customId.split('_');
       if (!isMod && (action === 'approve' || action === 'decline')) {
-        return interaction.reply({ content: 'Only moderators can approve/decline registrations!', flags: [4096] });
+        return interaction.reply({ content: 'Only moderators can approve/decline registrations!', flags: [64] });
       }
 
       const embed = interaction.message.embeds[0];
       const playerName = embed.footer?.text.split(': ')[1].split(' | ')[0];
 
       if (action === 'approve') {
-        if (!playerName) return interaction.reply('Error: Player name not found in request!');
+        if (!playerName) return interaction.reply({ content: 'Error: Player name not found in request!', flags: [64] });
 
         const dbRow = await getQuery('players', { user_id: userId, guild_id: guildId });
         const member = interaction.guild.members.cache.get(userId);
@@ -1299,11 +1299,11 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (customId === 'next_match' || customId === 'maps' || customId === 'teams') {
-      if (!isMod) return interaction.reply({ content: 'Only moderators can use this!', flags: [4096] });
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this!', flags: [64] });
 
       const matchEmbed = interaction.message.embeds[0];
       if (!matchEmbed || !matchEmbed.title || !matchEmbed.title.match(/Match #\d+/)) {
-        return interaction.reply({ content: 'Invalid match embed!', flags: [4096] });
+        return interaction.reply({ content: 'Invalid match embed!', flags: [64] });
       }
 
       try {
@@ -1401,12 +1401,12 @@ client.on('interactionCreate', async interaction => {
         }
       } catch (error) {
         console.error(`Button handler error (${customId}):`, error);
-        await interaction.reply({ content: 'An error occurred while processing this action!', flags: [4096] });
+        await interaction.reply({ content: 'An error occurred while processing this action!', flags: [64] });
       }
     }
 
     if (customId === 'reset_season_yes' || customId === 'reset_season_no') {
-      if (!isMod) return interaction.reply({ content: 'Only moderators can confirm this action!', flags: [4096] });
+      if (!isMod) return interaction.reply({ content: 'Only moderators can confirm this action!', flags: [64] });
 
       await interaction.deferUpdate();
 
