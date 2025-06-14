@@ -260,7 +260,6 @@ client.once('ready', async () => {
     console.log('Slash commands registered successfully!');
   } catch (error) {
     console.error('Error registering slash commands:', error);
-    // Log a warning but continue to allow queue initialization
     console.log('Continuing with partial initialization due to command registration failure.');
   }
   console.log('Slash command registration process completed.');
@@ -278,7 +277,23 @@ client.once('ready', async () => {
         if (!msgId) continue;
 
         const queueMsg = await channel.messages.fetch(msgId).catch(() => null);
-        if (!queueMsg) continue;
+        if (!queueMsg) {
+          // Message is inaccessible or deleted, create a new one
+          const embed = new EmbedBuilder()
+            .setTitle(title || 'Matchmaking Queue')
+            .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
+            .setColor('#0099ff')
+            .setFooter({ text: 'Queue initialized on bot startup' })
+            .setTimestamp();
+          const newQueueMsg = await channel.send({ embeds: [embed] });
+          await runQuery('settings', 'UPDATE', { key: `queue_message_${channel_id}`, guild_id: guild.id }, { value: newQueueMsg.id })
+            .catch(async (error) => {
+              if (error.code === 11000) {
+                await runQuery('settings', 'UPDATE', { key: `queue_message_${channel_id}`, guild_id: guild.id }, { value: newQueueMsg.id });
+              } else throw error;
+            });
+          continue;
+        }
 
         const membersWithRole = guild.members.cache.filter(member => member.roles.cache.has(role_id));
         const players = [];
@@ -1502,6 +1517,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
     const hadRole = oldMember.roles.cache.has(role_id);
     const hasRole = newMember.roles.cache.has(role_id);
 
+    // Only proceed if the role change matches this queue's role_id
     if (!hadRole && hasRole) {
       if (players.includes(`<@${newMember.id}>`)) continue;
       if (count >= 10) continue;
@@ -1523,6 +1539,8 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
       embed = EmbedBuilder.from(embed)
         .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${count}/10`)
         .setFooter({ text: `@${newMember.displayName} left the queue` });
+    } else {
+      continue; // Skip if no relevant role change for this queue
     }
 
     // Repost the embed as a new message if count < 10
@@ -1535,11 +1553,13 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
           } else throw error;
         });
 
-      // Delete the old message to clean up 
-      await queueMsg.delete().catch(err => {
-        if (err.code === 10008) console.log(`Old queue message ${msgId} already deleted or inaccessible`);
-        else console.error(`Error deleting old queue message ${msgId}:`, err);
-      });
+      // Delete the old message silently to avoid clutter
+      if (queueMsg.deletable) {
+        await queueMsg.delete().catch(err => {
+          // Suppress warning for already deleted messages
+          if (err.code !== 10008) console.error(`Error deleting old queue message ${msgId}:`, err);
+        });
+      }
     } else {
       // Edit the existing message if count = 10, then proceed to create match
       await queueMsg.edit({ embeds: [embed] });
