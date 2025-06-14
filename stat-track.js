@@ -488,17 +488,20 @@ client.on('interactionCreate', async interaction => {
     }
 
     if (commandName === 'score') {
-      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', flags: [4096] });
+      if (!isMod) return interaction.reply({ content: 'Only moderators can use this command!', flags: [64] });
       const matchId = options.getInteger('match_id');
       const winnerTeam = options.getInteger('winner_team');
       const mvp1 = options.getUser('mvp1');
       const mvp2 = options.getUser('mvp2');
-      if (winnerTeam !== 1 && winnerTeam !== 2) return interaction.reply('Winner team must be 1 or 2!');
+      if (winnerTeam !== 1 && winnerTeam !== 2) return interaction.reply({ content: 'Winner team must be 1 or 2!', flags: [64] });
+
+      // Defer the interaction to give more time for processing
+      await interaction.deferReply();
 
       console.log(`Scoring match: matchId=${matchId}, guildId=${interaction.guildId}`);
       const match = await getQuery('matches', { match_number: matchId, guild_id: interaction.guildId });
-      if (!match) return interaction.reply(`Match #${matchId} not found!`);
-      if (match.scored) return interaction.reply(`Match #${matchId} has already been scored!`);
+      if (!match) return interaction.editReply(`Match #${matchId} not found!`);
+      if (match.scored) return interaction.editReply(`Match #${matchId} has already been scored!`);
 
       const ctTeam = match.ct_team.split(',').map(id => id.trim().replace(/<@|>/g, ''));
       const trTeam = match.tr_team.split(',').map(id => id.trim().replace(/<@|>/g, ''));
@@ -508,37 +511,42 @@ client.on('interactionCreate', async interaction => {
       const bonus = parseInt((await getQuery('settings', { key: `queue_bonus_${interaction.channelId}`, guild_id: interaction.guildId }))?.value || 0);
 
       const eloChanges = [];
-      for (const userId of winningTeam) {
-        const playerElo = (await getQuery('players', { user_id: userId, guild_id: interaction.guildId }))?.elo || 0;
-        const rank = await getQuery('ranks', { start_elo: { $lte: playerElo }, guild_id: interaction.guildId }, { sort: { start_elo: -1 } });
-        const winElo = rank?.win_elo || 0;
-        const isMvp = (userId === mvp1?.id || userId === mvp2?.id);
-        const { oldElo, newElo, name } = await updatePlayerEloAndRank(db, interaction.guild, userId, winElo, isMvp, bonus, updatesChannelId);
-        eloChanges.push(`[${oldElo}] -> [${newElo}] ${name}`);
-      }
-      for (const userId of losingTeam) {
-        const playerElo = (await getQuery('players', { user_id: userId, guild_id: interaction.guildId }))?.elo || 0;
-        const rank = await getQuery('ranks', { start_elo: { $lte: playerElo }, guild_id: interaction.guildId }, { sort: { start_elo: -1 } });
-        const lossElo = -(rank?.loss_elo || 0);
-        const isMvp = (userId === mvp1?.id || userId === mvp2?.id);
-        const { oldElo, newElo, name } = await updatePlayerEloAndRank(db, interaction.guild, userId, lossElo, isMvp, 0, updatesChannelId);
-        eloChanges.push(`[${oldElo}] -> [${newElo}] ${name}`);
-      }
+      try {
+        for (const userId of winningTeam) {
+          const playerElo = (await getQuery('players', { user_id: userId, guild_id: interaction.guildId }))?.elo || 0;
+          const rank = await getQuery('ranks', { start_elo: { $lte: playerElo }, guild_id: interaction.guildId }, { sort: { start_elo: -1 } });
+          const winElo = rank?.win_elo || 0;
+          const isMvp = (userId === mvp1?.id || userId === mvp2?.id);
+          const { oldElo, newElo, name } = await updatePlayerEloAndRank(db, interaction.guild, userId, winElo, isMvp, bonus, updatesChannelId);
+          eloChanges.push(`[${oldElo}] -> [${newElo}] ${name}`);
+        }
+        for (const userId of losingTeam) {
+          const playerElo = (await getQuery('players', { user_id: userId, guild_id: interaction.guildId }))?.elo || 0;
+          const rank = await getQuery('ranks', { start_elo: { $lte: playerElo }, guild_id: interaction.guildId }, { sort: { start_elo: -1 } });
+          const lossElo = -(rank?.loss_elo || 0);
+          const isMvp = (userId === mvp1?.id || userId === mvp2?.id);
+          const { oldElo, newElo, name } = await updatePlayerEloAndRank(db, interaction.guild, userId, lossElo, isMvp, 0, updatesChannelId);
+          eloChanges.push(`[${oldElo}] -> [${newElo}] ${name}`);
+        }
 
-      await runQuery('matches', 'UPDATE', { match_number: matchId, guild_id: interaction.guildId }, {
-        scored: 1,
-        winner_team: winnerTeam,
-        mvp1: mvp1?.id || null,
-        mvp2: mvp2?.id || null,
-        bonus: bonus
-      });
+        await runQuery('matches', 'UPDATE', { match_number: matchId, guild_id: interaction.guildId }, {
+          scored: 1,
+          winner_team: winnerTeam,
+          mvp1: mvp1?.id || null,
+          mvp2: mvp2?.id || null,
+          bonus: bonus
+        });
 
-      const embed = new EmbedBuilder()
-        .setTitle(`Match #${matchId} Results`)
-        .setDescription(eloChanges.join('\n'))
-        .setColor('#00ff00')
-        .setFooter({ text: `Match #${matchId} has been scored` });
-      interaction.reply({ embeds: [embed] });
+        const embed = new EmbedBuilder()
+          .setTitle(`Match #${matchId} Results`)
+          .setDescription(eloChanges.join('\n'))
+          .setColor('#00ff00')
+          .setFooter({ text: `Match #${matchId} has been scored` });
+        await interaction.editReply({ embeds: [embed] });
+      } catch (error) {
+        console.error(`Error scoring match #${matchId}:`, error);
+        await interaction.editReply({ content: 'An error occurred while scoring the match. Please try again or contact a moderator.', flags: [64] });
+      }
     }
 
     if (commandName === 'sub') {
