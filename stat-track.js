@@ -1506,11 +1506,6 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
       embed = EmbedBuilder.from(embed)
         .setDescription(`**Players:**\n${players.join('\n')}\n\n**Count:** ${count}/10`)
         .setFooter({ text: `@${newMember.displayName} joined the queue` });
-      await queueMsg.edit({ embeds: [embed] });
-
-      if (count === 10) {
-        await createMatch(db, channel, players, guildId);
-      }
     } else if (hadRole && !hasRole) {
       const index = players.indexOf(`<@${newMember.id}>`);
       if (index === -1) continue;
@@ -1520,7 +1515,29 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
       embed = EmbedBuilder.from(embed)
         .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${count}/10`)
         .setFooter({ text: `@${newMember.displayName} left the queue` });
+    }
+
+    // Repost the embed as a new message if count < 10
+    if (count < 10) {
+      const newQueueMsg = await channel.send({ embeds: [embed] });
+      await runQuery('settings', 'UPDATE', { key: `queue_message_${channel_id}`, guild_id: guildId }, { value: newQueueMsg.id })
+        .catch(async (error) => {
+          if (error.code === 11000) {
+            await runQuery('settings', 'UPDATE', { key: `queue_message_${channel_id}`, guild_id: guildId }, { value: newQueueMsg.id });
+          } else throw error;
+        });
+
+      // Delete the old message to clean up 
+      await queueMsg.delete().catch(err => {
+        if (err.code === 10008) console.log(`Old queue message ${msgId} already deleted or inaccessible`);
+        else console.error(`Error deleting old queue message ${msgId}:`, err);
+      });
+    } else {
+      // Edit the existing message if count = 10, then proceed to create match
       await queueMsg.edit({ embeds: [embed] });
+      if (count === 10) {
+        await createMatch(db, channel, players, guildId);
+      }
     }
   }
 });
