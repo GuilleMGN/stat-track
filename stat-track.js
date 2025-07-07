@@ -1383,15 +1383,33 @@ client.on('interactionCreate', async interaction => {
             }
           }
 
-          const queueTitle = (await getQuery('queues', { channel_id: channelId, guild_id: guildId }))?.title || 'Matchmaking Queue';
-          const newQueueEmbed = new EmbedBuilder()
-            .setTitle(queueTitle)
-            .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
-            .setColor('#0099ff')
-            .setFooter({ text: 'New queue started' })
-            .setTimestamp();
-          const newQueueMsg = await interaction.channel.send({ embeds: [newQueueEmbed] });
-          await runQuery('settings', 'INSERT', null, { key: `queue_message_${channelId}`, value: newQueueMsg.id, guild_id: guildId });
+          // Delay new queue initialization by 2 minutes
+          setTimeout(async () => {
+            const queue = await getQuery('queues', { channel_id: channelId, guild_id: guildId });
+            if (!queue) return;
+
+            const membersWithRole = interaction.guild.members.cache.filter(member => member.roles.cache.has(queue.role_id));
+            const players = [];
+            for (const member of membersWithRole.values()) {
+              const isRegistered = await getQuery('players', { user_id: member.id, guild_id: guildId });
+              if (isRegistered) players.push(`<@${member.id}>`);
+            }
+
+            const queueTitle = queue.title || 'Matchmaking Queue';
+            const newQueueEmbed = new EmbedBuilder()
+              .setTitle(queueTitle)
+              .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${players.length}/10`)
+              .setColor('#0099ff')
+              .setFooter({ text: 'New queue started after 2-minute delay' })
+              .setTimestamp();
+            const newQueueMsg = await channel.send({ embeds: [newQueueEmbed] });
+            await runQuery('settings', 'INSERT', null, { key: `queue_message_${channelId}`, value: newQueueMsg.id, guild_id: guildId })
+              .catch(async (error) => {
+                if (error.code === 11000) {
+                  await runQuery('settings', 'UPDATE', { key: `queue_message_${channelId}`, guild_id: guildId }, { value: newQueueMsg.id });
+                } else throw error;
+              });
+          }, 2 * 60 * 1000); // 2 minutes in milliseconds
 
           await interaction.deferUpdate();
         }
