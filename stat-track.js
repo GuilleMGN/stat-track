@@ -180,7 +180,7 @@ const createMatch = async (db, channel, players, guildId) => {
   await channel.send({ embeds: [embed], components: [row] });
 };
 
-// VC Role Check
+// Sstore active timers and intervals
 if (!client.activeQueues) client.activeQueues = new Map();
 
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
@@ -321,9 +321,6 @@ async function updateQueuePeriodically(db, channel, queue, role_id, guildId) {
     }
   }
 }
-
-// Remove the 9/10 repost logic from the original handler
-// (The existing if (count < 9) { ... } else if (count >= 9) { ... } block is no longer needed and can be simplified)
 
 // Slash commands 
 const commands = [
@@ -1634,83 +1631,6 @@ client.on('interactionCreate', async interaction => {
           .setColor('#ff0000');
         await interaction.editReply({ embeds: [updatedEmbed], components: [disabledRow] });
       }
-    }
-  }
-});
-
-// Guild member update (adapted for MongoDB)
-client.on('guildMemberUpdate', async (oldMember, newMember) => {
-  const guildId = newMember.guild.id;
-  const db = await getDb();
-
-  const queues = await allQuery('queues', { guild_id: guildId });
-  for (const queue of queues) {
-    const { channel_id, role_id, title } = queue;
-    const channel = newMember.guild.channels.cache.get(channel_id);
-    if (!channel) continue;
-
-    const msgId = (await getQuery('settings', { key: `queue_message_${channel_id}`, guild_id: guildId }))?.value;
-    if (!msgId) continue;
-
-    const queueMsg = await channel.messages.fetch(msgId).catch(() => null);
-    if (!queueMsg) continue;
-
-    let embed = queueMsg.embeds[0];
-    let players = embed.description.match(/\*\*Players:\*\*\n([\s\S]*?)\n\n\*\*Count:/)[1].split('\n').filter(p => p && p !== 'None');
-    let count = players.length;
-
-    const hadRole = oldMember.roles.cache.has(role_id);
-    const hasRole = newMember.roles.cache.has(role_id);
-
-    // Only proceed if the role change matches this queue's role_id
-    if (!hadRole && hasRole) {
-      if (players.includes(`<@${newMember.id}>`)) continue;
-      if (count >= 10) continue;
-
-      const isRegistered = await getQuery('players', { user_id: newMember.id, guild_id: guildId });
-      if (!isRegistered) continue;
-
-      players.push(`<@${newMember.id}>`);
-      count++;
-      embed = EmbedBuilder.from(embed)
-        .setDescription(`**Players:**\n${players.join('\n')}\n\n**Count:** ${count}/10`)
-        .setFooter({ text: `@${newMember.displayName} joined the queue` });
-
-      // Edit the embed until 9/10, then repost at 9/10 or more
-      if (count < 9) {
-        await queueMsg.edit({ embeds: [embed] });
-      } else if (count >= 9) {
-        const newQueueMsg = await channel.send({ embeds: [embed] });
-        await runQuery('settings', 'UPDATE', { key: `queue_message_${channel_id}`, guild_id: guildId }, { value: newQueueMsg.id })
-          .catch(async (error) => {
-            if (error.code === 11000) {
-              await runQuery('settings', 'UPDATE', { key: `queue_message_${channel_id}`, guild_id: guildId }, { value: newQueueMsg.id });
-            } else throw error;
-          });
-        // Delete the old message silently
-        if (queueMsg.deletable) {
-          await queueMsg.delete().catch(err => {
-            if (err.code !== 10008) console.error(`Error deleting old queue message ${msgId}:`, err);
-          });
-        }
-      }
-    } else if (hadRole && !hasRole) {
-      const index = players.indexOf(`<@${newMember.id}>`);
-      if (index === -1) continue;
-
-      players.splice(index, 1);
-      count--;
-      embed = EmbedBuilder.from(embed)
-        .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${count}/10`)
-        .setFooter({ text: `@${newMember.displayName} left the queue` });
-    } else {
-      continue; // Skip if no relevant role change for this queue
-    }
-
-    // Handle the case where count reaches 10
-    if (count === 10) {
-      await queueMsg.edit({ embeds: [embed] });
-      await createMatch(db, channel, players, guildId);
     }
   }
 });
