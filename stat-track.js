@@ -180,6 +180,151 @@ const createMatch = async (db, channel, players, guildId) => {
   await channel.send({ embeds: [embed], components: [row] });
 };
 
+// VC Role Check
+if (!client.activeQueues) client.activeQueues = new Map();
+
+client.on('guildMemberUpdate', async (oldMember, newMember) => {
+  const guildId = newMember.guild.id;
+  const db = await getDb();
+
+  const queues = await allQuery('queues', { guild_id: guildId });
+  for (const queue of queues) {
+    const { channel_id, role_id, title } = queue;
+    const channel = newMember.guild.channels.cache.get(channel_id);
+    if (!channel) continue;
+
+    const msgId = (await getQuery('settings', { key: `queue_message_${channel_id}`, guild_id: guildId }))?.value;
+    if (!msgId) continue;
+
+    const queueMsg = await channel.messages.fetch(msgId).catch(() => null);
+    if (!queueMsg) continue;
+
+    let embed = queueMsg.embeds[0];
+    let players = embed.description.match(/\*\*Players:\*\*\n([\s\S]*?)\n\n\*\*Count:/)[1].split('\n').filter(p => p && p !== 'None');
+    let count = players.length;
+
+    const hadRole = oldMember.roles.cache.has(role_id);
+    const hasRole = newMember.roles.cache.has(role_id);
+
+    // Only proceed if the role change matches this queue's role_id
+    if (!hadRole && hasRole) {
+      if (players.includes(`<@${newMember.id}>`)) continue;
+      if (count >= 10) continue;
+
+      const isRegistered = await getQuery('players', { user_id: newMember.id, guild_id: guildId });
+      if (!isRegistered) continue;
+
+      players.push(`<@${newMember.id}>`);
+      count++;
+      embed = EmbedBuilder.from(embed)
+        .setDescription(`**Players:**\n${players.join('\n')}\n\n**Count:** ${count}/10`)
+        .setFooter({ text: `@${newMember.displayName} joined the queue` });
+
+      await queueMsg.edit({ embeds: [embed] });
+
+      // Start or reset the 1-minute timer if this is the first player
+      if (count === 1) {
+        const activeQueue = client.activeQueues.get(channel_id) || {};
+        if (activeQueue.timer) clearTimeout(activeQueue.timer);
+        if (activeQueue.interval) clearInterval(activeQueue.interval);
+
+        activeQueue.timer = setTimeout(async () => {
+          await updateQueuePeriodically(db, channel, queue, role_id, guildId);
+          activeQueue.interval = setInterval(async () => {
+            await updateQueuePeriodically(db, channel, queue, role_id, guildId);
+          }, 60 * 1000); // 1 minute interval
+          client.activeQueues.set(channel_id, activeQueue);
+        }, 60 * 1000); // 1-minute initial delay
+        client.activeQueues.set(channel_id, activeQueue);
+      }
+    } else if (hadRole && !hasRole) {
+      const index = players.indexOf(`<@${newMember.id}>`);
+      if (index === -1) continue;
+
+      players.splice(index, 1);
+      count--;
+      embed = EmbedBuilder.from(embed)
+        .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${count}/10`)
+        .setFooter({ text: `@${newMember.displayName} left the queue` });
+
+      await queueMsg.edit({ embeds: [embed] });
+
+      // Check if the queue should stop or continue
+      const membersWithRole = newMember.guild.members.cache.filter(member => member.roles.cache.has(role_id));
+      if (membersWithRole.size === 0) {
+        const activeQueue = client.activeQueues.get(channel_id);
+        if (activeQueue) {
+          if (activeQueue.timer) clearTimeout(activeQueue.timer);
+          if (activeQueue.interval) clearInterval(activeQueue.interval);
+          client.activeQueues.delete(channel_id);
+        }
+      }
+    }
+
+    // Handle the case where count reaches 10
+    if (count === 10) {
+      await queueMsg.edit({ embeds: [embed] });
+      await createMatch(db, channel, players, guildId);
+
+      // Stop the periodic update loop
+      const activeQueue = client.activeQueues.get(channel_id);
+      if (activeQueue) {
+        if (activeQueue.timer) clearTimeout(activeQueue.timer);
+        if (activeQueue.interval) clearInterval(activeQueue.interval);
+        client.activeQueues.delete(channel_id);
+      }
+    }
+  }
+});
+
+// New function to handle periodic queue updates
+async function updateQueuePeriodically(db, channel, queue, role_id, guildId) {
+  const membersWithRole = channel.guild.members.cache.filter(member => member.roles.cache.has(role_id));
+  const players = [];
+  for (const member of membersWithRole.values()) {
+    const isRegistered = await getQuery('players', { user_id: member.id, guild_id: guildId });
+    if (isRegistered) players.push(`<@${member.id}>`);
+  }
+
+  const count = players.length;
+  const queueTitle = queue.title || 'Matchmaking Queue';
+  const newEmbed = new EmbedBuilder()
+    .setTitle(queueTitle)
+    .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${count}/10`)
+    .setColor('#0099ff')
+    .setFooter({ text: 'Queue updated' })
+    .setTimestamp();
+
+  const msgId = (await getQuery('settings', { key: `queue_message_${queue.channel_id}`, guild_id: guildId }))?.value;
+  const oldMsg = await channel.messages.fetch(msgId).catch(() => null);
+  if (oldMsg && oldMsg.deletable) {
+    await oldMsg.delete().catch(err => {
+      if (err.code !== 10008) console.error(`Error deleting old queue message ${msgId}:`, err);
+    });
+  }
+
+  const newQueueMsg = await channel.send({ embeds: [newEmbed] });
+  await runQuery('settings', 'UPDATE', { key: `queue_message_${queue.channel_id}`, guild_id: guildId }, { value: newQueueMsg.id })
+    .catch(async (error) => {
+      if (error.code === 11000) {
+        await runQuery('settings', 'UPDATE', { key: `queue_message_${queue.channel_id}`, guild_id: guildId }, { value: newQueueMsg.id });
+      } else throw error;
+    });
+
+  // Stop the interval if no players have the role
+  if (count === 0) {
+    const activeQueue = client.activeQueues.get(queue.channel_id);
+    if (activeQueue) {
+      if (activeQueue.timer) clearTimeout(activeQueue.timer);
+      if (activeQueue.interval) clearInterval(activeQueue.interval);
+      client.activeQueues.delete(queue.channel_id);
+    }
+  }
+}
+
+// Remove the 9/10 repost logic from the original handler
+// (The existing if (count < 9) { ... } else if (count >= 9) { ... } block is no longer needed and can be simplified)
+
 // Slash commands 
 const commands = [
   new SlashCommandBuilder().setName('add_map').setDescription('Add a map to the database')
@@ -1558,25 +1703,6 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
       embed = EmbedBuilder.from(embed)
         .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${count}/10`)
         .setFooter({ text: `@${newMember.displayName} left the queue` });
-
-      // Edit the embed if count < 9, repost if previously at 9/10 or more
-      if (count < 9) {
-        await queueMsg.edit({ embeds: [embed] });
-      } else if (count >= 9) {
-        const newQueueMsg = await channel.send({ embeds: [embed] });
-        await runQuery('settings', 'UPDATE', { key: `queue_message_${channel_id}`, guild_id: guildId }, { value: newQueueMsg.id })
-          .catch(async (error) => {
-            if (error.code === 11000) {
-              await runQuery('settings', 'UPDATE', { key: `queue_message_${channel_id}`, guild_id: guildId }, { value: newQueueMsg.id });
-            } else throw error;
-          });
-        // Delete the old message silently
-        if (queueMsg.deletable) {
-          await queueMsg.delete().catch(err => {
-            if (err.code !== 10008) console.error(`Error deleting old queue message ${msgId}:`, err);
-          });
-        }
-      }
     } else {
       continue; // Skip if no relevant role change for this queue
     }
