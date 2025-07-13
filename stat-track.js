@@ -1367,11 +1367,9 @@ client.on('interactionCreate', async interaction => {
             );
           await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
 
-          // Delay new queue initialization by 30 seconds
-          setTimeout(async () => {
-            const queue = await getQuery('queues', { channel_id: channelId, guild_id: guildId });
-            if (!queue) return;
-
+          // Immediate new queue initialization (timer removed)
+          const queue = await getQuery('queues', { channel_id: channelId, guild_id: guildId });
+          if (queue) {
             const membersWithRole = interaction.guild.members.cache.filter(member => member.roles.cache.has(queue.role_id));
             const players = [];
             for (const member of membersWithRole.values()) {
@@ -1384,7 +1382,7 @@ client.on('interactionCreate', async interaction => {
               .setTitle(queueTitle)
               .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${players.length}/10`)
               .setColor('#0099ff')
-              .setFooter({ text: 'New queue started after 2-minute delay' })
+              .setFooter({ text: 'New queue started' })
               .setTimestamp();
             const newQueueMsg = await channel.send({ embeds: [newQueueEmbed] });
             await runQuery('settings', 'INSERT', null, { key: `queue_message_${channelId}`, value: newQueueMsg.id, guild_id: guildId })
@@ -1393,7 +1391,7 @@ client.on('interactionCreate', async interaction => {
                   await runQuery('settings', 'UPDATE', { key: `queue_message_${channelId}`, guild_id: guildId }, { value: newQueueMsg.id });
                 } else throw error;
               });
-          }, 30 * 1000); // 30 seconds in milliseconds
+          }
 
           await interaction.deferUpdate();
         }
