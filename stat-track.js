@@ -1367,23 +1367,7 @@ client.on('interactionCreate', async interaction => {
             );
           await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
 
-          const voiceChannelId = (await getQuery('queues', { channel_id: channelId, guild_id: guildId }))?.voice_channel_id;
-          if (voiceChannelId) {
-            const voiceChannel = interaction.guild.channels.cache.get(voiceChannelId);
-            if (voiceChannel && voiceChannel.type === 2) {
-              const members = voiceChannel.members;
-              for (const member of members.values()) {
-                try {
-                  await member.voice.disconnect();
-                  console.log(`Kicked ${member.user.tag} from voice channel ${voiceChannelId}`);
-                } catch (error) {
-                  console.error(`Failed to kick ${member.user.tag} from voice channel ${voiceChannelId}:`, error);
-                }
-              }
-            }
-          }
-
-          // Delay new queue initialization by 2 minutes
+          // Delay new queue initialization by 30 seconds
           setTimeout(async () => {
             const queue = await getQuery('queues', { channel_id: channelId, guild_id: guildId });
             if (!queue) return;
@@ -1409,7 +1393,7 @@ client.on('interactionCreate', async interaction => {
                   await runQuery('settings', 'UPDATE', { key: `queue_message_${channelId}`, guild_id: guildId }, { value: newQueueMsg.id });
                 } else throw error;
               });
-          }, 2 * 60 * 1000); // 2 minutes in milliseconds
+          }, 30 * 1000); // 30 seconds in milliseconds
 
           await interaction.deferUpdate();
         }
