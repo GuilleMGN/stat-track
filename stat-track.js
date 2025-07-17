@@ -1497,14 +1497,32 @@ client.on('interactionCreate', async interaction => {
           const trTeam = trMatch[1].split('\n').filter(line => line.trim()).map(id => id.replace(/<@|>/g, ''));
           const map = mapMatch[1];
 
-          await runQuery('matches', 'INSERT', null, {
-            match_number: matchNumber,
-            ct_team: ctTeam.join(','),
-            tr_team: trTeam.join(','),
-            map,
-            guild_id: guildId,
-            scored: 0
-          });
+          try {
+            await runQuery('matches', 'UPDATE', { match_number: matchNumber, guild_id: guildId }, {
+              $setOnInsert: {
+                ct_team: ctTeam.join(','),
+                tr_team: trTeam.join(','),
+                map,
+                guild_id: guildId,
+                scored: 0
+              }
+            }, { upsert: true });
+          } catch (error) {
+            if (error.code === 11000) {
+              // Handle duplicate by incrementing match number
+              const nextMatchNumber = await getNextMatchNumber(guildId);
+              await runQuery('matches', 'INSERT', null, {
+                match_number: nextMatchNumber,
+                ct_team: ctTeam.join(','),
+                tr_team: trTeam.join(','),
+                map,
+                guild_id: guildId,
+                scored: 0
+              });
+            } else {
+              throw error;
+            }
+          }
 
           const resultsChannelId = (await getQuery('settings', { key: 'results_channel', guild_id: guildId }))?.value;
           if (resultsChannelId) {
@@ -1523,7 +1541,7 @@ client.on('interactionCreate', async interaction => {
           // Wait 1 minute before starting the new queue cycle
           const queue = await getQuery('queues', { channel_id: channelId, guild_id: guildId });
           if (queue) {
-            const activeQueue = client.activeQueues.get(channel_id) || {};
+            const activeQueue = client.activeQueues.get(channelId) || {}; 
             if (activeQueue.timer) clearTimeout(activeQueue.timer);
             if (activeQueue.interval) clearInterval(activeQueue.interval);
 
@@ -1532,9 +1550,9 @@ client.on('interactionCreate', async interaction => {
               activeQueue.interval = setInterval(async () => {
                 await updateQueuePeriodically(db, channel, queue, queue.role_id, guildId);
               }, 60 * 1000); // 1 minute interval
-              client.activeQueues.set(channel_id, activeQueue);
+              client.activeQueues.set(channelId, activeQueue); 
             }, 60 * 1000); // 1-minute initial delay after Next
-            client.activeQueues.set(channel_id, activeQueue);
+            client.activeQueues.set(channelId, activeQueue); 
           }
 
           await interaction.deferUpdate();
