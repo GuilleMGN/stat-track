@@ -263,15 +263,26 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
 
     // Handle the case where count reaches 10
     if (count === 10) {
-      await queueMsg.edit({ embeds: [embed] });
-      await createMatch(db, channel, players, guildId);
+      try {
+        await createMatch(db, channel, players, guildId); // Create match first
+        embed = EmbedBuilder.from(embed)
+          .setDescription(`**Players:**\n${players.join('\n')}\n\n**Count:** ${count}/10`)
+          .setFooter({ text: 'Match created!' });
+        await queueMsg.edit({ embeds: [embed] });
 
-      // Stop the periodic update loop
-      const activeQueue = client.activeQueues.get(channel_id);
-      if (activeQueue) {
-        if (activeQueue.timer) clearTimeout(activeQueue.timer);
-        if (activeQueue.interval) clearInterval(activeQueue.interval);
-        client.activeQueues.delete(channel_id);
+        // Stop the periodic update loop
+        const activeQueue = client.activeQueues.get(channel_id);
+        if (activeQueue) {
+          if (activeQueue.timer) clearTimeout(activeQueue.timer);
+          if (activeQueue.interval) clearInterval(activeQueue.interval);
+          client.activeQueues.delete(channel_id);
+        }
+      } catch (error) {
+        console.error(`Error creating match in channel ${channel_id}:`, error);
+        embed = EmbedBuilder.from(embed)
+          .setDescription(`**Players:**\n${players.join('\n')}\n\n**Count:** ${count}/10`)
+          .setFooter({ text: 'Error creating match!' });
+        await queueMsg.edit({ embeds: [embed] });
       }
     }
   }
