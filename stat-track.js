@@ -180,7 +180,7 @@ const createMatch = async (db, channel, players, guildId) => {
   await channel.send({ embeds: [embed], components: [row] });
 };
 
-// Sstore active timers and intervals
+// Store active timers and intervals
 if (!client.activeQueues) client.activeQueues = new Map();
 
 client.on('guildMemberUpdate', async (oldMember, newMember) => {
@@ -311,8 +311,8 @@ async function updateQueuePeriodically(db, channel, queue, role_id, guildId) {
       } else throw error;
     });
 
-  // Stop the interval if no players have the role
-  if (count === 0) {
+  // Stop the interval if no players have the role or count reaches 10
+  if (count === 0 || count === 10) {
     const activeQueue = client.activeQueues.get(queue.channel_id);
     if (activeQueue) {
       if (activeQueue.timer) clearTimeout(activeQueue.timer);
@@ -1509,30 +1509,21 @@ client.on('interactionCreate', async interaction => {
             );
           await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
 
-          // Immediate new queue initialization (timer removed)
+          // Wait 1 minute before starting the new queue cycle
           const queue = await getQuery('queues', { channel_id: channelId, guild_id: guildId });
           if (queue) {
-            const membersWithRole = interaction.guild.members.cache.filter(member => member.roles.cache.has(queue.role_id));
-            const players = [];
-            for (const member of membersWithRole.values()) {
-              const isRegistered = await getQuery('players', { user_id: member.id, guild_id: guildId });
-              if (isRegistered) players.push(`<@${member.id}>`);
-            }
+            const activeQueue = client.activeQueues.get(channel_id) || {};
+            if (activeQueue.timer) clearTimeout(activeQueue.timer);
+            if (activeQueue.interval) clearInterval(activeQueue.interval);
 
-            const queueTitle = queue.title || 'Matchmaking Queue';
-            const newQueueEmbed = new EmbedBuilder()
-              .setTitle(queueTitle)
-              .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${players.length}/10`)
-              .setColor('#0099ff')
-              .setFooter({ text: 'New queue started' })
-              .setTimestamp();
-            const newQueueMsg = await channel.send({ embeds: [newQueueEmbed] });
-            await runQuery('settings', 'INSERT', null, { key: `queue_message_${channelId}`, value: newQueueMsg.id, guild_id: guildId })
-              .catch(async (error) => {
-                if (error.code === 11000) {
-                  await runQuery('settings', 'UPDATE', { key: `queue_message_${channelId}`, guild_id: guildId }, { value: newQueueMsg.id });
-                } else throw error;
-              });
+            activeQueue.timer = setTimeout(async () => {
+              await updateQueuePeriodically(db, channel, queue, queue.role_id, guildId);
+              activeQueue.interval = setInterval(async () => {
+                await updateQueuePeriodically(db, channel, queue, queue.role_id, guildId);
+              }, 60 * 1000); // 1 minute interval
+              client.activeQueues.set(channel_id, activeQueue);
+            }, 60 * 1000); // 1-minute initial delay after Next
+            client.activeQueues.set(channel_id, activeQueue);
           }
 
           await interaction.deferUpdate();
