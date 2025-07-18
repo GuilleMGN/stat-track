@@ -1418,62 +1418,6 @@ client.on('interactionCreate', async interaction => {
     const { customId, user, guildId, channelId } = interaction;
     const db = await getDb();
 
-    if (customId.startsWith('approve_') || customId.startsWith('decline_')) {
-      const [action, userId] = customId.split('_');
-      if (!isMod && (action === 'approve' || action === 'decline')) {
-        return interaction.reply({ content: 'Only moderators can approve/decline registrations!', flags: [64] });
-      }
-
-      const embed = interaction.message.embeds[0];
-      const playerName = embed.footer?.text.split(': ')[1].split(' | ')[0];
-
-      if (action === 'approve') {
-        if (!playerName) return interaction.reply({ content: 'Error: Player name not found in request!', flags: [64] });
-
-        const dbRow = await getQuery('players', { user_id: userId, guild_id: guildId });
-        const member = interaction.guild.members.cache.get(userId);
-        const registeredRoleId = (await getQuery('settings', { key: 'registered_role', guild_id: guildId }))?.value;
-
-        if (dbRow) {
-          if (dbRow.name !== playerName) {
-            await runQuery('players', 'UPDATE', { user_id: userId, guild_id: guildId }, { name: playerName });
-          }
-          if (registeredRoleId) member.roles.add(registeredRoleId).catch(console.error);
-          await assignRankedRole(db, interaction.guild, userId, dbRow.elo);
-          member.setNickname(`${dbRow.elo} | ${playerName}`).catch(console.error);
-          const updatedEmbed = EmbedBuilder.from(embed)
-            .setDescription(`<@${userId}> registration approved!`)
-            .setColor('#00ff00')
-            .setFooter({ text: `Re-registered as: ${playerName}` });
-          await interaction.update({ embeds: [updatedEmbed], components: [] });
-        } else {
-          await runQuery('players', 'INSERT', null, {
-            user_id: userId,
-            name: playerName,
-            elo: 0,
-            wins: 0,
-            losses: 0,
-            mvps: 0,
-            guild_id: guildId
-          });
-          if (registeredRoleId) member.roles.add(registeredRoleId).catch(console.error);
-          await assignRankedRole(db, interaction.guild, userId, 0);
-          member.setNickname(`0 | ${playerName}`).catch(console.error);
-          const updatedEmbed = EmbedBuilder.from(embed)
-            .setDescription(`<@${userId}> registration approved!`)
-            .setColor('#00ff00')
-            .setFooter({ text: `Registered as: ${playerName}` });
-          await interaction.update({ embeds: [updatedEmbed], components: [] });
-        }
-      } else if (action === 'decline') {
-        const updatedEmbed = EmbedBuilder.from(embed)
-          .setDescription(`<@${userId}> registration declined!`)
-          .setColor('#ff0000')
-          .setFooter({ text: embed.footer?.text });
-        await interaction.update({ embeds: [updatedEmbed], components: [] });
-      }
-    }
-
     if (customId === 'next_match' || customId === 'maps' || customId === 'teams') {
       if (!isMod) return interaction.reply({ content: 'Only moderators can use this!', flags: [64] });
 
@@ -1486,7 +1430,7 @@ client.on('interactionCreate', async interaction => {
         if (customId === 'next_match') {
           const matchNumberMatch = matchEmbed.title.match(/#(\d+)/);
           if (!matchNumberMatch) throw new Error('Could not extract match number from title');
-          const matchNumber = parseInt(matchNumberMatch[1]);
+          let matchNumber = parseInt(matchNumberMatch[1]);
 
           const ctMatch = matchEmbed.description.match(/\*\*CT Team 1:\*\*\n([\s\S]*?)\n\n\*\*TR Team 2:/);
           const trMatch = matchEmbed.description.match(/\*\*TR Team 2:\*\*\n([\s\S]*?)\n\n\*\*Map:/);
@@ -1497,6 +1441,7 @@ client.on('interactionCreate', async interaction => {
           const trTeam = trMatch[1].split('\n').filter(line => line.trim()).map(id => id.replace(/<@|>/g, ''));
           const map = mapMatch[1];
 
+          // Insert or update match with incremented number if needed
           try {
             await runQuery('matches', 'UPDATE', { match_number: matchNumber, guild_id: guildId }, {
               $setOnInsert: {
@@ -1509,10 +1454,9 @@ client.on('interactionCreate', async interaction => {
             }, { upsert: true });
           } catch (error) {
             if (error.code === 11000) {
-              // Handle duplicate by incrementing match number
-              const nextMatchNumber = await getNextMatchNumber(guildId);
+              matchNumber = await getNextMatchNumber(guildId); // Increment match number on duplicate
               await runQuery('matches', 'INSERT', null, {
-                match_number: nextMatchNumber,
+                match_number: matchNumber,
                 ct_team: ctTeam.join(','),
                 tr_team: trTeam.join(','),
                 map,
@@ -1524,10 +1468,14 @@ client.on('interactionCreate', async interaction => {
             }
           }
 
+          // Send to results channel with the correct match number
           const resultsChannelId = (await getQuery('settings', { key: 'results_channel', guild_id: guildId }))?.value;
           if (resultsChannelId) {
             const resultsChannel = interaction.guild.channels.cache.get(resultsChannelId);
-            if (resultsChannel) await resultsChannel.send({ embeds: [matchEmbed] });
+            if (resultsChannel) {
+              const resultsEmbed = EmbedBuilder.from(matchEmbed).setTitle(`Match #${matchNumber}`);
+              await resultsChannel.send({ embeds: [resultsEmbed] });
+            }
           }
 
           const disabledRow = new ActionRowBuilder()
@@ -1538,21 +1486,39 @@ client.on('interactionCreate', async interaction => {
             );
           await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
 
-          // Wait 1 minute before starting the new queue cycle
-          const queue = await getQuery('queues', { channel_id: channelId, guild_id: guildId });
+          // Immediately create a new queue embed in the original queue channel
+          const queue = await getQuery('queues', { guild_id: guildId });
           if (queue) {
-            const activeQueue = client.activeQueues.get(channelId) || {}; 
-            if (activeQueue.timer) clearTimeout(activeQueue.timer);
-            if (activeQueue.interval) clearInterval(activeQueue.interval);
+            const queueChannel = interaction.guild.channels.cache.get(queue.channel_id);
+            if (queueChannel) {
+              const newQueueEmbed = new EmbedBuilder()
+                .setTitle(queue.title || 'Matchmaking Queue')
+                .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
+                .setColor('#0099ff')
+                .setFooter({ text: 'New queue started' })
+                .setTimestamp();
+              const newQueueMsg = await queueChannel.send({ embeds: [newQueueEmbed] });
+              await runQuery('settings', 'UPDATE', { key: `queue_message_${queue.channel_id}`, guild_id: guildId }, { value: newQueueMsg.id })
+                .catch(async (error) => {
+                  if (error.code === 11000) {
+                    await runQuery('settings', 'UPDATE', { key: `queue_message_${queue.channel_id}`, guild_id: guildId }, { value: newQueueMsg.id });
+                  } else throw error;
+                });
 
-            activeQueue.timer = setTimeout(async () => {
-              await updateQueuePeriodically(db, channel, queue, queue.role_id, guildId);
-              activeQueue.interval = setInterval(async () => {
-                await updateQueuePeriodically(db, channel, queue, queue.role_id, guildId);
-              }, 60 * 1000); // 1 minute interval
-              client.activeQueues.set(channelId, activeQueue); 
-            }, 60 * 1000); // 1-minute initial delay after Next
-            client.activeQueues.set(channelId, activeQueue); 
+              // Restart the queue cycle
+              const activeQueue = client.activeQueues.get(queue.channel_id) || {};
+              if (activeQueue.timer) clearTimeout(activeQueue.timer);
+              if (activeQueue.interval) clearInterval(activeQueue.interval);
+
+              activeQueue.timer = setTimeout(async () => {
+                await updateQueuePeriodically(db, queueChannel, queue, queue.role_id, guildId);
+                activeQueue.interval = setInterval(async () => {
+                  await updateQueuePeriodically(db, queueChannel, queue, queue.role_id, guildId);
+                }, 60 * 1000); // 1 minute interval
+                client.activeQueues.set(queue.channel_id, activeQueue);
+              }, 60 * 1000); // 1-minute initial delay
+              client.activeQueues.set(queue.channel_id, activeQueue);
+            }
           }
 
           await interaction.deferUpdate();
