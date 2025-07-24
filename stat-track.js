@@ -1484,16 +1484,28 @@ client.on('interactionCreate', async interaction => {
               new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary).setDisabled(true),
               new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary).setDisabled(true)
             );
-          await interaction.message.edit({ embeds: [matchEmbed], components: [disabledRow] });
+          await interaction.message.delete();
+          const newMatchEmbed = EmbedBuilder.from(matchEmbed).setTitle(`Match #${matchNumber}`);
+          await interaction.channel.send({ embeds: [newMatchEmbed], components: [disabledRow] });
 
-          // Immediately create a new queue embed in the original queue channel
+          // Delete and resend new queue embed in the original queue channel
           const queue = await getQuery('queues', { guild_id: guildId });
           if (queue) {
             const queueChannel = interaction.guild.channels.cache.get(queue.channel_id);
             if (queueChannel) {
+              const msgId = (await getQuery('settings', { key: `queue_message_${queue.channel_id}`, guild_id: guildId }))?.value;
+              if (msgId) {
+                const oldQueueMsg = await queueChannel.messages.fetch(msgId).catch(() => null);
+                if (oldQueueMsg && oldQueueMsg.deletable) {
+                  await oldQueueMsg.delete().catch(err => console.error(`Error deleting old queue message ${msgId}:`, err));
+                }
+              }
+              const membersWithRole = queueChannel.guild.members.cache.filter(member => member.roles.cache.has(queue.role_id));
+              const players = membersWithRole.map(member => `<@${member.id}>`);
+              const count = players.length;
               const newQueueEmbed = new EmbedBuilder()
                 .setTitle(queue.title || 'Matchmaking Queue')
-                .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
+                .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${count}/10`)
                 .setColor('#0099ff')
                 .setFooter({ text: 'New queue started' })
                 .setTimestamp();
@@ -1525,10 +1537,25 @@ client.on('interactionCreate', async interaction => {
         }
 
         if (customId === 'maps') {
+          const ctMatch = matchEmbed.description.match(/\*\*CT Team 1:\*\*\n([\s\S]*?)\n\n\*\*TR Team 2:/);
+          const trMatch = matchEmbed.description.match(/\*\*TR Team 2:\*\*\n([\s\S]*?)\n\n\*\*Map:/);
+          if (!ctMatch || !trMatch) throw new Error('Invalid team description format');
+          const ctTeam = ctMatch[1].split('\n').filter(line => line.trim());
+          const trTeam = trMatch[1].split('\n').filter(line => line.trim());
           const newMap = await getRandomMap(guildId);
-          const updatedEmbed = EmbedBuilder.from(matchEmbed)
-            .setDescription(matchEmbed.description.replace(/\*\*Map:\*\* .*/, `**Map:** ${newMap}`));
-          await interaction.message.edit({ embeds: [updatedEmbed] });
+          await interaction.message.delete();
+          const newMatchEmbed = new EmbedBuilder()
+            .setTitle(matchEmbed.title)
+            .setDescription(`**CT Team 1:**\n${ctTeam.join('\n')}\n\n**TR Team 2:**\n${trTeam.join('\n')}\n\n**Map:** ${newMap}`)
+            .setColor('#ff9900')
+            .setTimestamp();
+          const row = new ActionRowBuilder()
+            .addComponents(
+              new ButtonBuilder().setCustomId('next_match').setLabel('Next').setStyle(ButtonStyle.Success),
+              new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary),
+              new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary)
+            );
+          await interaction.channel.send({ embeds: [newMatchEmbed], components: [row] });
           await interaction.deferUpdate();
         }
 
@@ -1536,18 +1563,24 @@ client.on('interactionCreate', async interaction => {
           const ctMatch = matchEmbed.description.match(/\*\*CT Team 1:\*\*\n([\s\S]*?)\n\n\*\*TR Team 2:/);
           const trMatch = matchEmbed.description.match(/\*\*TR Team 2:\*\*\n([\s\S]*?)\n\n\*\*Map:/);
           if (!ctMatch || !trMatch) throw new Error('Invalid team description format');
-
-          const players = [
-            ...ctMatch[1].split('\n').filter(line => line.trim()),
-            ...trMatch[1].split('\n').filter(line => line.trim())
-          ];
+          const players = [...ctMatch[1].split('\n').filter(line => line.trim()), ...trMatch[1].split('\n').filter(line => line.trim())];
           const [newCtTeam, newTrTeam] = shuffleAndSplit(players);
           const mapMatch = matchEmbed.description.match(/\*\*Map:\*\* (.*)/);
           if (!mapMatch) throw new Error('Invalid map format in description');
-          const mapLine = `**Map:** ${mapMatch[1]}`;
-          const updatedEmbed = EmbedBuilder.from(matchEmbed)
-            .setDescription(`**CT Team 1:**\n${newCtTeam.join('\n')}\n\n**TR Team 2:**\n${newTrTeam.join('\n')}\n\n${mapLine}`);
-          await interaction.message.edit({ embeds: [updatedEmbed] });
+          const map = mapMatch[1];
+          await interaction.message.delete();
+          const newMatchEmbed = new EmbedBuilder()
+            .setTitle(matchEmbed.title)
+            .setDescription(`**CT Team 1:**\n${newCtTeam.join('\n')}\n\n**TR Team 2:**\n${newTrTeam.join('\n')}\n\n**Map:** ${map}`)
+            .setColor('#ff9900')
+            .setTimestamp();
+          const row = new ActionRowBuilder()
+            .addComponents(
+              new ButtonBuilder().setCustomId('next_match').setLabel('Next').setStyle(ButtonStyle.Success),
+              new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary),
+              new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary)
+            );
+          await interaction.channel.send({ embeds: [newMatchEmbed], components: [row] });
           await interaction.deferUpdate();
         }
       } catch (error) {
