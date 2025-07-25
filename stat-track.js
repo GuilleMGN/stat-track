@@ -305,7 +305,7 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   }
 });
 
-// New function to handle periodic queue updates
+// Update the periodic queue update function
 async function updateQueuePeriodically(db, channel, queue, role_id, guildId) {
   const membersWithRole = channel.guild.members.cache.filter(member => member.roles.cache.has(role_id));
   const players = [];
@@ -336,13 +336,50 @@ async function updateQueuePeriodically(db, channel, queue, role_id, guildId) {
     .catch(async (error) => {
       if (error.code === 11000) {
         await runQuery('settings', 'UPDATE', { key: `queue_message_${queue.channel_id}`, guild_id: guildId }, { value: newQueueMsg.id });
-      } else throw error;
+      } else {
+        console.error(`Error updating queue message ID for channel ${queue.channel_id}:`, error);
+      }
     });
 
-  // Stop the interval if no players have the role or count reaches 10
-  if (count === 0 || count === 10) {
-    const activeQueue = client.activeQueues.get(queue.channel_id);
-    if (activeQueue) {
+  // Create match if 10 players are present
+  if (count === 10) {
+    try {
+      await createMatch(db, channel, players, guildId);
+      const matchEmbed = new EmbedBuilder()
+        .setTitle(queueTitle)
+        .setDescription(`**Players:**\n${players.join('\n')}\n\n**Count:** ${count}/10`)
+        .setColor('#0099ff')
+        .setFooter({ text: 'Match created!' })
+        .setTimestamp();
+      await newQueueMsg.edit({ embeds: [matchEmbed] });
+
+      // Stop the periodic update until reset by next_match
+      const activeQueue = client.activeQueues.get(queue.channel_id);
+      if (activeQueue) {
+        if (activeQueue.timer) clearTimeout(activeQueue.timer);
+        if (activeQueue.interval) clearInterval(activeQueue.interval);
+        client.activeQueues.delete(queue.channel_id);
+      }
+    } catch (error) {
+      console.error(`Error creating match in channel ${queue.channel_id}:`, error);
+      const errorEmbed = new EmbedBuilder()
+        .setTitle(queueTitle)
+        .setDescription(`**Players:**\n${players.join('\n')}\n\n**Count:** ${count}/10`)
+        .setColor('#ff0000')
+        .setFooter({ text: 'Error creating match!' })
+        .setTimestamp();
+      await newQueueMsg.edit({ embeds: [errorEmbed] });
+    }
+  } else {
+    // Continue periodic updates if fewer than 10 players
+    const activeQueue = client.activeQueues.get(queue.channel_id) || {};
+    if (count > 0) {
+      activeQueue.timer = setTimeout(async () => {
+        await updateQueuePeriodically(db, channel, queue, role_id, guildId);
+      }, 60 * 1000); // 1-minute delay
+      client.activeQueues.set(queue.channel_id, activeQueue);
+    } else {
+      // Stop updates if no players, but keep timer ready to restart
       if (activeQueue.timer) clearTimeout(activeQueue.timer);
       if (activeQueue.interval) clearInterval(activeQueue.interval);
       client.activeQueues.delete(queue.channel_id);
@@ -1433,7 +1470,7 @@ client.on('interactionCreate', async interaction => {
   if (interaction.isButton()) {
     const { customId } = interaction;
 
-    // Handler for 'next_match' button (from previous fix)
+    // Handler for 'next_match' button 
     if (customId === 'next_match') {
       if (!isMod) return interaction.reply({ content: 'Only moderators can use this!', flags: [64] });
 
@@ -1459,7 +1496,6 @@ client.on('interactionCreate', async interaction => {
         // Verify match exists in database
         const existingMatch = await getQuery('matches', { match_number: matchNumber, guild_id: interaction.guildId });
         if (!existingMatch) {
-          // If match doesn't exist, create it
           await runQuery('matches', 'INSERT', null, {
             match_number: matchNumber,
             ct_team: ctTeam.join(','),
@@ -1480,7 +1516,27 @@ client.on('interactionCreate', async interaction => {
           }
         }
 
-        // Disable buttons and delete original message
+        // Find the queue for this specific channel
+        const queue = await getQuery('queues', { channel_id: interaction.channelId, guild_id: interaction.guildId });
+        if (!queue) throw new Error(`No queue found for channel ${interaction.channelId}`);
+
+        // Kick all players from the voice channel
+        if (queue.voice_channel_id) {
+          const voiceChannel = interaction.guild.channels.cache.get(queue.voice_channel_id);
+          if (voiceChannel && voiceChannel.type === 2) { // Ensure it's a voice channel
+            const members = voiceChannel.members;
+            for (const member of members.values()) {
+              try {
+                await member.voice.setChannel(null);
+                console.log(`Kicked ${member.user.tag} from voice channel ${voiceChannel.id}`);
+              } catch (error) {
+                console.error(`Failed to kick ${member.user.tag} from voice channel ${voiceChannel.id}:`, error);
+              }
+            }
+          }
+        }
+
+        // Disable buttons and delete original match message
         const disabledRow = new ActionRowBuilder()
           .addComponents(
             new ButtonBuilder().setCustomId('next_match').setLabel('Next').setStyle(ButtonStyle.Success).setDisabled(true),
@@ -1491,45 +1547,45 @@ client.on('interactionCreate', async interaction => {
         await interaction.channel.send({ embeds: [EmbedBuilder.from(matchEmbed).setTitle(`Match #${matchNumber}`)], components: [disabledRow] });
 
         // Reset queue
-        const queue = await getQuery('queues', { guild_id: interaction.guildId });
-        if (queue) {
-          const queueChannel = interaction.guild.channels.cache.get(queue.channel_id);
-          if (queueChannel) {
-            const msgId = (await getQuery('settings', { key: `queue_message_${queue.channel_id}`, guild_id: interaction.guildId }))?.value;
-            if (msgId) {
-              const oldQueueMsg = await queueChannel.messages.fetch(msgId).catch(() => null);
-              if (oldQueueMsg && oldQueueMsg.deletable) {
-                await oldQueueMsg.delete().catch(err => console.error(`Error deleting old queue message ${msgId}:`, err));
-              }
+        const queueChannel = interaction.guild.channels.cache.get(queue.channel_id);
+        if (queueChannel) {
+          // Delete old queue message
+          const msgId = (await getQuery('settings', { key: `queue_message_${queue.channel_id}`, guild_id: interaction.guildId }))?.value;
+          if (msgId) {
+            const oldQueueMsg = await queueChannel.messages.fetch(msgId).catch(() => null);
+            if (oldQueueMsg && oldQueueMsg.deletable) {
+              await oldQueueMsg.delete().catch(err => console.error(`Error deleting old queue message ${msgId}:`, err));
             }
-            const membersWithRole = queueChannel.guild.members.cache.filter(member => member.roles.cache.has(queue.role_id));
-            const players = membersWithRole.map(member => `<@${member.id}>`);
-            const count = players.length;
-            const newQueueEmbed = new EmbedBuilder()
-              .setTitle(queue.title || 'Matchmaking Queue')
-              .setDescription(`**Players:**\n${players.length ? players.join('\n') : 'None'}\n\n**Count:** ${count}/10`)
-              .setColor('#0099ff')
-              .setFooter({ text: 'New queue started' })
-              .setTimestamp();
-            const newQueueMsg = await queueChannel.send({ embeds: [newQueueEmbed] });
-            await runQuery('settings', 'UPDATE', { key: `queue_message_${queue.channel_id}`, guild_id: interaction.guildId }, { value: newQueueMsg.id })
-              .catch(async (error) => {
-                if (error.code === 11000) {
-                  await runQuery('settings', 'UPDATE', { key: `queue_message_${queue.channel_id}`, guild_id: interaction.guildId }, { value: newQueueMsg.id });
-                } else throw error;
-              });
+          }
 
-            // Restart the queue cycle
-            const activeQueue = client.activeQueues.get(queue.channel_id) || {};
-            if (activeQueue.timer) clearTimeout(activeQueue.timer);
-            if (activeQueue.interval) clearInterval(activeQueue.interval);
+          // Send new queue embed with 0 players
+          const newQueueEmbed = new EmbedBuilder()
+            .setTitle(queue.title || 'Matchmaking Queue')
+            .setDescription('**Players:**\nNone\n\n**Count:** 0/10')
+            .setColor('#0099ff')
+            .setFooter({ text: 'New queue started' })
+            .setTimestamp();
+          const newQueueMsg = await queueChannel.send({ embeds: [newQueueEmbed] });
+          await runQuery('settings', 'UPDATE', { key: `queue_message_${queue.channel_id}`, guild_id: interaction.guildId }, { value: newQueueMsg.id })
+            .catch(async (error) => {
+              if (error.code === 11000) {
+                await runQuery('settings', 'UPDATE', { key: `queue_message_${queue.channel_id}`, guild_id: interaction.guildId }, { value: newQueueMsg.id });
+              } else {
+                console.error(`Error updating queue message ID for channel ${queue.channel_id}:`, error);
+              }
+            });
 
+          // Restart the queue update cycle
+          const activeQueue = client.activeQueues.get(queue.channel_id) || {};
+          if (activeQueue.timer) clearTimeout(activeQueue.timer);
+          if (activeQueue.interval) clearInterval(activeQueue.interval);
+          client.activeQueues.delete(queue.channel_id); // Clear any existing timers
+
+          // Start a new timer only if there are players with the role
+          const membersWithRole = queueChannel.guild.members.cache.filter(member => member.roles.cache.has(queue.role_id));
+          if (membersWithRole.size > 0) {
             activeQueue.timer = setTimeout(async () => {
               await updateQueuePeriodically(db, queueChannel, queue, queue.role_id, interaction.guildId);
-              activeQueue.interval = setInterval(async () => {
-                await updateQueuePeriodically(db, queueChannel, queue, queue.role_id, interaction.guildId);
-              }, 60 * 1000); // 1 minute interval
-              client.activeQueues.set(queue.channel_id, activeQueue);
             }, 60 * 1000); // 1-minute initial delay
             client.activeQueues.set(queue.channel_id, activeQueue);
           }
