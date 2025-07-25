@@ -305,7 +305,6 @@ client.on('guildMemberUpdate', async (oldMember, newMember) => {
   }
 });
 
-// Update the periodic queue update function
 async function updateQueuePeriodically(db, channel, queue, role_id, guildId) {
   const membersWithRole = channel.guild.members.cache.filter(member => member.roles.cache.has(role_id));
   const players = [];
@@ -323,14 +322,29 @@ async function updateQueuePeriodically(db, channel, queue, role_id, guildId) {
     .setFooter({ text: 'Queue updated' })
     .setTimestamp();
 
+  // Fetch and delete old queue message
   const msgId = (await getQuery('settings', { key: `queue_message_${queue.channel_id}`, guild_id: guildId }))?.value;
-  const oldMsg = await channel.messages.fetch(msgId).catch(() => null);
-  if (oldMsg && oldMsg.deletable) {
-    await oldMsg.delete().catch(err => {
-      if (err.code !== 10008) console.error(`Error deleting old queue message ${msgId}:`, err);
-    });
+  if (msgId) {
+    try {
+      const oldMsg = await channel.messages.fetch(msgId);
+      if (oldMsg.deletable) {
+        await oldMsg.delete();
+        console.log(`Deleted old queue message ${msgId} in channel ${queue.channel_id}`);
+      } else {
+        console.warn(`Old queue message ${msgId} in channel ${queue.channel_id} is not deletable (check permissions)`);
+      }
+    } catch (err) {
+      if (err.code !== 10008) { // Ignore "Unknown Message" errors
+        console.error(`Error deleting queue message ${msgId} in channel ${queue.channel_id}:`, err);
+      } else {
+        console.log(`Queue message ${msgId} not found in channel ${queue.channel_id}, proceeding with new message`);
+      }
+    }
+  } else {
+    console.log(`No queue message ID found for channel ${queue.channel_id}, creating new message`);
   }
 
+  // Send new queue message and update database
   const newQueueMsg = await channel.send({ embeds: [newEmbed] });
   await runQuery('settings', 'UPDATE', { key: `queue_message_${queue.channel_id}`, guild_id: guildId }, { value: newQueueMsg.id })
     .catch(async (error) => {
@@ -1240,6 +1254,7 @@ client.on('interactionCreate', async interaction => {
       interaction.reply({ embeds: [embed] });
     }
 
+    // Updated /add_queue command handler (replace in interactionCreate event)
     if (commandName === 'add_queue') {
       if (!isMod) return interaction.reply('Only moderators can use this command!');
       const channel = options.getChannel('channel_id');
@@ -1250,6 +1265,15 @@ client.on('interactionCreate', async interaction => {
 
       if (channel.type !== 0) return interaction.reply('The channel_id must be a text channel!');
       if (voiceChannel.type !== 2) return interaction.reply('The voice_channel_id must be a voice channel!');
+
+      // Check bot permissions in the text channel
+      const botMember = interaction.guild.members.me;
+      if (!botMember.permissionsIn(channel).has(['SEND_MESSAGES', 'EMBED_LINKS', 'MANAGE_MESSAGES'])) {
+        return interaction.reply('I need SEND_MESSAGES, EMBED_LINKS, and MANAGE_MESSAGES permissions in the text channel!');
+      }
+      if (!botMember.permissionsIn(voiceChannel).has(['MOVE_MEMBERS'])) {
+        return interaction.reply('I need MOVE_MEMBERS permission in the voice channel!');
+      }
 
       try {
         // Insert or update queue entry
