@@ -161,6 +161,8 @@ const createMatch = async (db, channel, players, guildId) => {
   const [ctTeam, trTeam] = shuffleAndSplit(players);
   const map = await getRandomMap(guildId);
   const bonus = (await getQuery('settings', { key: `queue_bonus_${channel.id}`, guild_id: guildId }))?.value || 0;
+  const queue = await getQuery('queues', { channel_id: channel.id, guild_id: guildId });
+  const rolePing = queue?.role_id ? `<@&${queue.role_id}>` : '';
 
   const embed = new EmbedBuilder()
     .setTitle(`Match #${matchNumber}`)
@@ -177,7 +179,7 @@ const createMatch = async (db, channel, players, guildId) => {
       new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary)
     );
 
-  await channel.send({ embeds: [embed], components: [row] });
+  await channel.send({ content: `${rolePing} Match is ready!`, embeds: [embed], components: [row] });
 };
 
 // Store active timers and intervals
@@ -1415,8 +1417,9 @@ client.on('interactionCreate', async interaction => {
   }
 
   if (interaction.isButton()) {
-    const { customId, user, guildId, channelId } = interaction;
-    const db = await getDb();
+    const { customId, guildId, channelId } = interaction;
+    const queue = await getQuery('queues', { channel_id: channelId, guild_id: guildId });
+    const rolePing = queue?.role_id ? `<@&${queue.role_id}>` : '';
 
     if (customId === 'next_match' || customId === 'maps' || customId === 'teams') {
       if (!isMod) return interaction.reply({ content: 'Only moderators can use this!', flags: [64] });
@@ -1486,7 +1489,7 @@ client.on('interactionCreate', async interaction => {
             );
           await interaction.message.delete();
           const newMatchEmbed = EmbedBuilder.from(matchEmbed).setTitle(`Match #${matchNumber}`);
-          await interaction.channel.send({ embeds: [newMatchEmbed], components: [disabledRow] });
+          await interaction.channel.send({ content: `${rolePing} Match confirmed!`, embeds: [newMatchEmbed], components: [disabledRow] });
 
           // Delete and resend new queue embed in the original queue channel
           const queue = await getQuery('queues', { guild_id: guildId });
@@ -1555,7 +1558,7 @@ client.on('interactionCreate', async interaction => {
               new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary),
               new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary)
             );
-          await interaction.channel.send({ embeds: [newMatchEmbed], components: [row] });
+          await interaction.channel.send({ content: `${rolePing} Map changed!`, embeds: [newMatchEmbed], components: [row] });
           await interaction.deferUpdate();
         }
 
@@ -1580,7 +1583,7 @@ client.on('interactionCreate', async interaction => {
               new ButtonBuilder().setCustomId('maps').setLabel('Maps').setStyle(ButtonStyle.Primary),
               new ButtonBuilder().setCustomId('teams').setLabel('Teams').setStyle(ButtonStyle.Primary)
             );
-          await interaction.channel.send({ embeds: [newMatchEmbed], components: [row] });
+          await interaction.channel.send({ content: `${rolePing} Teams reshuffled!`, embeds: [newMatchEmbed], components: [row] });
           await interaction.deferUpdate();
         }
       } catch (error) {
